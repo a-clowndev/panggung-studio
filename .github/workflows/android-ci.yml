@@ -14,6 +14,11 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake ninja-build nasm yasm pkg-config autoconf automake libtool gettext autopoint texinfo
+
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
@@ -35,7 +40,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: native/deps/install
-          key: panggung-deps-arm64-${{ hashFiles('tools/build-deps-full.sh') }}
+          key: panggung-deps-arm64-v2-${{ hashFiles('tools/build-deps*.sh') }}
 
       - name: Build native deps (if cache miss)
         if: steps.cache-deps.outputs.cache-hit != 'true'

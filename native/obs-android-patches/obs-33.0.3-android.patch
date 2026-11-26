@@ -1,0 +1,521 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 7ae5611..dad6902 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -24,14 +24,23 @@ if(OS_WINDOWS)
+   add_subdirectory(libobs-d3d11)
+   add_subdirectory(libobs-winrt)
+ endif()
+-add_subdirectory(libobs-opengl)
++if(OS_ANDROID)
++  add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../libobs-gles" "${CMAKE_CURRENT_BINARY_DIR}/libobs-gles")
++  add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../android-plugins" "${CMAKE_CURRENT_BINARY_DIR}/android-plugins")
++else()
++  add_subdirectory(libobs-opengl)
++endif()
+ if(OS_MACOS)
+   add_subdirectory(libobs-metal)
+ endif()
+ add_subdirectory(plugins)
+ 
+-add_subdirectory(test/test-input)
++if(NOT OS_ANDROID)
++  add_subdirectory(test/test-input)
++endif()
+ 
+-add_subdirectory(frontend)
++if(ENABLE_FRONTEND)
++  add_subdirectory(frontend)
++endif()
+ 
+ message_configuration()
+diff --git a/cmake/common/osconfig.cmake b/cmake/common/osconfig.cmake
+index 4c30147..0e89dc0 100644
+--- a/cmake/common/osconfig.cmake
++++ b/cmake/common/osconfig.cmake
+@@ -2,7 +2,12 @@
+ 
+ include_guard(GLOBAL)
+ 
+-if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
++if(ANDROID OR CMAKE_SYSTEM_NAME STREQUAL "Android" OR DEFINED ANDROID_ABI)
++  set(CMAKE_CXX_EXTENSIONS FALSE)
++  list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/android")
++  set(OS_ANDROID TRUE)
++  set(OS_FLATPAK FALSE)
++elseif(CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
+   set(CMAKE_C_EXTENSIONS FALSE)
+   set(CMAKE_CXX_EXTENSIONS FALSE)
+   list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/windows")
+diff --git a/libobs/CMakeLists.txt b/libobs/CMakeLists.txt
+index 71459cb..abef255 100644
+--- a/libobs/CMakeLists.txt
++++ b/libobs/CMakeLists.txt
+@@ -42,6 +42,7 @@ target_sources(
+     $<$<PLATFORM_ID:Darwin>:obs-core-modules-loader-mac.m>
+     $<$<PLATFORM_ID:Windows>:obs-core-modules-loader-win.c>
+     $<$<PLATFORM_ID:Linux,FreeBSD,OpenBSD>:obs-core-modules-loader-nix.c>
++    $<$<PLATFORM_ID:Android>:obs-core-modules-loader-android.c>
+     obs-core-modules-loader.h
+     obs-data.c
+     obs-data.h
+@@ -265,6 +266,8 @@ if(OS_WINDOWS)
+   include(cmake/os-windows.cmake)
+ elseif(OS_MACOS)
+   include(cmake/os-macos.cmake)
++elseif(OS_ANDROID)
++  include(cmake/os-android.cmake)
+ elseif(OS_LINUX)
+   include(cmake/os-linux.cmake)
+ elseif(OS_FREEBSD OR OS_OPENBSD)
+diff --git a/libobs/data/format_conversion.effect b/libobs/data/format_conversion.effect
+index 6d1088c..a63fcc1 100644
+--- a/libobs/data/format_conversion.effect
++++ b/libobs/data/format_conversion.effect
+@@ -568,32 +568,32 @@ float3 YUV_to_RGB(float3 yuv)
+ 	return float3(r, g, b);
+ }
+ 
+-float3 PSUYVY_Reverse(FragTexTex frag_in) : TARGET
++float4 PSUYVY_Reverse(FragTexTex frag_in) : TARGET
+ {
+ 	float2 y01 = image.Load(int3(frag_in.uvuv.xy, 0)).yw;
+-	float2 cbcr = image.Sample(def_sampler, frag_in.uvuv.zw, 0).zx;
++	float2 cbcr = image.Sample(def_sampler, frag_in.uvuv.zw, 0.0).zx;
+ 	float leftover = frac(frag_in.uvuv.x);
+ 	float y = (leftover < 0.5) ? y01.x : y01.y;
+ 	float3 yuv = float3(y, cbcr);
+ 	float3 rgb = YUV_to_RGB(yuv);
+-	return rgb;
++	return float4(rgb, 1.0);
+ }
+ 
+-float3 PSYUY2_Reverse(FragTexTex frag_in) : TARGET
++float4 PSYUY2_Reverse(FragTexTex frag_in) : TARGET
+ {
+ 	float2 y01 = image.Load(int3(frag_in.uvuv.xy, 0)).zx;
+-	float2 cbcr = image.Sample(def_sampler, frag_in.uvuv.zw, 0).yw;
++	float2 cbcr = image.Sample(def_sampler, frag_in.uvuv.zw, 0.0).yw;
+ 	float leftover = frac(frag_in.uvuv.x);
+ 	float y = (leftover < 0.5) ? y01.x : y01.y;
+ 	float3 yuv = float3(y, cbcr);
+ 	float3 rgb = YUV_to_RGB(yuv);
+-	return rgb;
++	return float4(rgb, 1.0);
+ }
+ 
+ float4 PSYUY2_PQ_Reverse(FragTexTex frag_in) : TARGET
+ {
+ 	float2 y01 = image.Load(int3(frag_in.uvuv.xy, 0)).zx;
+-	float2 cbcr = image.Sample(def_sampler, frag_in.uvuv.zw, 0).yw;
++	float2 cbcr = image.Sample(def_sampler, frag_in.uvuv.zw, 0.0).yw;
+ 	float leftover = frac(frag_in.uvuv.x);
+ 	float y = (leftover < 0.5) ? y01.x : y01.y;
+ 	float3 yuv = float3(y, cbcr);
+@@ -606,7 +606,7 @@ float4 PSYUY2_PQ_Reverse(FragTexTex frag_in) : TARGET
+ float4 PSYUY2_HLG_Reverse(FragTexTex frag_in) : TARGET
+ {
+ 	float2 y01 = image.Load(int3(frag_in.uvuv.xy, 0)).zx;
+-	float2 cbcr = image.Sample(def_sampler, frag_in.uvuv.zw, 0).yw;
++	float2 cbcr = image.Sample(def_sampler, frag_in.uvuv.zw, 0.0).yw;
+ 	float leftover = frac(frag_in.uvuv.x);
+ 	float y = (leftover < 0.5) ? y01.x : y01.y;
+ 	float3 yuv = float3(y, cbcr);
+@@ -616,25 +616,25 @@ float4 PSYUY2_HLG_Reverse(FragTexTex frag_in) : TARGET
+ 	return float4(rgb, 1.);
+ }
+ 
+-float3 PSYVYU_Reverse(FragTexTex frag_in) : TARGET
++float4 PSYVYU_Reverse(FragTexTex frag_in) : TARGET
+ {
+ 	float2 y01 = image.Load(int3(frag_in.uvuv.xy, 0)).zx;
+-	float2 cbcr = image.Sample(def_sampler, frag_in.uvuv.zw, 0).wy;
++	float2 cbcr = image.Sample(def_sampler, frag_in.uvuv.zw, 0.0).wy;
+ 	float leftover = frac(frag_in.uvuv.x);
+ 	float y = (leftover < 0.5) ? y01.x : y01.y;
+ 	float3 yuv = float3(y, cbcr);
+ 	float3 rgb = YUV_to_RGB(yuv);
+-	return rgb;
++	return float4(rgb, 1.0);
+ }
+ 
+-float3 PSPlanar420_Reverse(VertTexPos frag_in) : TARGET
++float4 PSPlanar420_Reverse(VertTexPos frag_in) : TARGET
+ {
+ 	float y = image.Load(int3(frag_in.pos.xy, 0)).x;
+ 	float cb = image1.Sample(def_sampler, frag_in.uv).x;
+ 	float cr = image2.Sample(def_sampler, frag_in.uv).x;
+ 	float3 yuv = float3(y, cb, cr);
+ 	float3 rgb = YUV_to_RGB(yuv);
+-	return rgb;
++	return float4(rgb, 1.0);
+ }
+ 
+ float4 PSPlanar420_PQ_Reverse(VertTexPos frag_in) : TARGET
+@@ -673,14 +673,14 @@ float4 PSPlanar420A_Reverse(VertTexPos frag_in) : TARGET
+ 	return rgba;
+ }
+ 
+-float3 PSPlanar422_Reverse(VertTexPos frag_in) : TARGET
++float4 PSPlanar422_Reverse(VertTexPos frag_in) : TARGET
+ {
+ 	float y = image.Load(int3(frag_in.pos.xy, 0)).x;
+ 	float cb = image1.Sample(def_sampler, frag_in.uv).x;
+ 	float cr = image2.Sample(def_sampler, frag_in.uv).x;
+ 	float3 yuv = float3(y, cb, cr);
+ 	float3 rgb = YUV_to_RGB(yuv);
+-	return rgb;
++	return float4(rgb, 1.0);
+ }
+ 
+ float4 PSPlanar422_10LE_Reverse(VertTexPos frag_in) : TARGET
+@@ -733,7 +733,7 @@ float4 PSPlanar422A_Reverse(VertTexPos frag_in) : TARGET
+ 	return rgba;
+ }
+ 
+-float3 PSPlanar444_Reverse(FragPos frag_in) : TARGET
++float4 PSPlanar444_Reverse(FragPos frag_in) : TARGET
+ {
+ 	int3 xy0 = int3(frag_in.pos.xy, 0);
+ 	float y = image.Load(xy0).x;
+@@ -741,7 +741,7 @@ float3 PSPlanar444_Reverse(FragPos frag_in) : TARGET
+ 	float cr = image2.Load(xy0).x;
+ 	float3 yuv = float3(y, cb, cr);
+ 	float3 rgb = YUV_to_RGB(yuv);
+-	return rgb;
++	return float4(rgb, 1.0);
+ }
+ 
+ float4 PSPlanar444_12LE_Reverse(FragPos frag_in) : TARGET
+@@ -764,7 +764,7 @@ float4 PSPlanar444_12LE_PQ_Reverse(FragPos frag_in) : TARGET
+ 	float cb = image1.Load(xy0).x;
+ 	float cr = image2.Load(xy0).x;
+ 	float3 yuv = float3(y, cb, cr);
+-	yuv *= 65535. / 4095;
++	yuv *= 65535. / 4095.;
+ 	float3 pq = YUV_to_RGB(yuv);
+ 	float3 hdr2020 = st2084_to_linear_eetf(pq, hdr_lw, hdr_lmax) * maximum_over_sdr_white_nits;
+ 	float3 rgb = rec2020_to_rec709(hdr2020);
+@@ -778,7 +778,7 @@ float4 PSPlanar444_12LE_HLG_Reverse(FragPos frag_in) : TARGET
+ 	float cb = image1.Load(xy0).x;
+ 	float cr = image2.Load(xy0).x;
+ 	float3 yuv = float3(y, cb, cr);
+-	yuv *= 65535. / 4095;
++	yuv *= 65535. / 4095.;
+ 	float3 hlg = YUV_to_RGB(yuv);
+ 	float3 hdr2020 = hlg_to_linear(hlg, hlg_exponent) * maximum_over_sdr_white_nits;
+ 	float3 rgb = rec2020_to_rec709(hdr2020);
+@@ -818,13 +818,13 @@ float4 PSAYUV_Reverse(FragPos frag_in) : TARGET
+ 	return rgba;
+ }
+ 
+-float3 PSNV12_Reverse(VertTexPos frag_in) : TARGET
++float4 PSNV12_Reverse(VertTexPos frag_in) : TARGET
+ {
+ 	float y = image.Load(int3(frag_in.pos.xy, 0)).x;
+ 	float2 cbcr = image1.Sample(def_sampler, frag_in.uv).xy;
+ 	float3 yuv = float3(y, cbcr);
+ 	float3 rgb = YUV_to_RGB(yuv);
+-	return rgb;
++	return float4(rgb, 1.0);
+ }
+ 
+ float4 PSNV12_PQ_Reverse(VertTexPos frag_in) : TARGET
+@@ -1011,17 +1011,17 @@ float4 PSV210_HLG_2020_709_Reverse(FragPos frag_in) : TARGET
+ 	return float4(rgb, 1.);
+ }
+ 
+-float3 PSY800_Limited(FragPos frag_in) : TARGET
++float4 PSY800_Limited(FragPos frag_in) : TARGET
+ {
+ 	float limited = image.Load(int3(frag_in.pos.xy, 0)).x;
+ 	float full = (255.0 / 219.0) * limited - (16.0 / 219.0);
+-	return float3(full, full, full);
++	return float4(float3(full, full, full), 1.0);
+ }
+ 
+-float3 PSY800_Full(FragPos frag_in) : TARGET
++float4 PSY800_Full(FragPos frag_in) : TARGET
+ {
+ 	float3 full = image.Load(int3(frag_in.pos.xy, 0)).xxx;
+-	return full;
++	return float4(full, 1.0);
+ }
+ 
+ float4 PSRGB_Limited(FragPos frag_in) : TARGET
+@@ -1031,7 +1031,7 @@ float4 PSRGB_Limited(FragPos frag_in) : TARGET
+ 	return rgba;
+ }
+ 
+-float3 PSBGR3_Limited(FragPos frag_in) : TARGET
++float4 PSBGR3_Limited(FragPos frag_in) : TARGET
+ {
+ 	float x = frag_in.pos.x * 3.0;
+ 	float y = frag_in.pos.y;
+@@ -1040,10 +1040,10 @@ float3 PSBGR3_Limited(FragPos frag_in) : TARGET
+ 	float r = image.Load(int3(x + 1.0, y, 0)).x;
+ 	float3 rgb = float3(r, g, b);
+ 	rgb = (255.0 / 219.0) * rgb - (16.0 / 219.0);
+-	return rgb;
++	return float4(rgb, 1.0);
+ }
+ 
+-float3 PSBGR3_Full(FragPos frag_in) : TARGET
++float4 PSBGR3_Full(FragPos frag_in) : TARGET
+ {
+ 	float x = frag_in.pos.x * 3.0;
+ 	float y = frag_in.pos.y;
+@@ -1051,7 +1051,7 @@ float3 PSBGR3_Full(FragPos frag_in) : TARGET
+ 	float g = image.Load(int3(x, y, 0)).x;
+ 	float r = image.Load(int3(x + 1.0, y, 0)).x;
+ 	float3 rgb = float3(r, g, b);
+-	return rgb;
++	return float4(rgb, 1.0);
+ }
+ 
+ float3 compute_r10l_reverse(float2 pos, bool limited)
+diff --git a/libobs/util/platform-nix.c b/libobs/util/platform-nix.c
+index 5648ca6..cfe79b1 100644
+--- a/libobs/util/platform-nix.c
++++ b/libobs/util/platform-nix.c
+@@ -27,7 +27,11 @@
+ #include <glob.h>
+ #include <time.h>
+ #include <signal.h>
++#ifdef __ANDROID__
++#include <sys/random.h>
++#else
+ #include <uuid/uuid.h>
++#endif
+ 
+ #include "obsconfig.h"
+ 
+@@ -1099,10 +1103,27 @@ uint64_t os_get_free_disk_space(const char *dir)
+ 
+ char *os_generate_uuid(void)
+ {
+-	uuid_t uuid;
+ 	// 36 char UUID + NULL
+ 	char *out = bmalloc(37);
++#ifdef __ANDROID__
++	uint8_t b[16] = {0};
++	if (getrandom(b, sizeof(b), 0) != (ssize_t)sizeof(b)) {
++		FILE *f = fopen("/dev/urandom", "rb");
++		if (f) {
++			(void)fread(b, 1, sizeof(b), f);
++			fclose(f);
++		}
++	}
++	b[6] = (uint8_t)((b[6] & 0x0F) | 0x40); /* version 4 */
++	b[8] = (uint8_t)((b[8] & 0x3F) | 0x80); /* variant 1 */
++	snprintf(out, 37,
++		 "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
++		 b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
++		 b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
++#else
++	uuid_t uuid;
+ 	uuid_generate(uuid);
+ 	uuid_unparse_lower(uuid, out);
++#endif
+ 	return out;
+ }
+diff --git a/plugins/CMakeLists.txt b/plugins/CMakeLists.txt
+index 397b703..93165bd 100644
+--- a/plugins/CMakeLists.txt
++++ b/plugins/CMakeLists.txt
+@@ -107,7 +107,10 @@ add_core_module(obs-webrtc)
+ 
+ check_obs_websocket()
+ 
+-add_core_module(obs-x264)
++option(ENABLE_X264 "Enable x264 software encoder" ON)
++if(ENABLE_X264)
++  add_core_module(obs-x264)
++endif()
+ add_core_module(oss-audio PLATFORMS FREEBSD OPENBSD)
+ add_core_module(rtmp-services)
+ add_core_module(sndio PLATFORMS LINUX FREEBSD OPENBSD)
+diff --git a/plugins/obs-ffmpeg/CMakeLists.txt b/plugins/obs-ffmpeg/CMakeLists.txt
+index 7d37eeb..4e3d710 100644
+--- a/plugins/obs-ffmpeg/CMakeLists.txt
++++ b/plugins/obs-ffmpeg/CMakeLists.txt
+@@ -59,7 +59,7 @@ target_link_libraries(
+     FFmpeg::avcodec
+     FFmpeg::avfilter
+     FFmpeg::avformat
+-    FFmpeg::avdevice
++    $<$<NOT:$<BOOL:${OS_ANDROID}>>:FFmpeg::avdevice>
+     FFmpeg::avutil
+     FFmpeg::swscale
+     FFmpeg::swresample
+diff --git a/plugins/obs-ffmpeg/cmake/dependencies.cmake b/plugins/obs-ffmpeg/cmake/dependencies.cmake
+index 5e523cd..45a5e89 100644
+--- a/plugins/obs-ffmpeg/cmake/dependencies.cmake
++++ b/plugins/obs-ffmpeg/cmake/dependencies.cmake
+@@ -1,8 +1,16 @@
+-find_package(
+-  FFmpeg
+-  6.1
+-  REQUIRED avcodec avfilter avdevice avutil swscale avformat swresample
+-)
++if(OS_ANDROID)
++  find_package(
++    FFmpeg
++    6.1
++    REQUIRED avcodec avfilter avutil swscale avformat swresample
++  )
++else()
++  find_package(
++    FFmpeg
++    6.1
++    REQUIRED avcodec avfilter avdevice avutil swscale avformat swresample
++  )
++endif()
+ 
+ if(NOT TARGET OBS::media-playback)
+   add_subdirectory("${CMAKE_SOURCE_DIR}/shared/media-playback" "${CMAKE_BINARY_DIR}/shared/media-playback")
+diff --git a/plugins/obs-ffmpeg/obs-ffmpeg.c b/plugins/obs-ffmpeg/obs-ffmpeg.c
+index d7880e5..56df4b7 100644
+--- a/plugins/obs-ffmpeg/obs-ffmpeg.c
++++ b/plugins/obs-ffmpeg/obs-ffmpeg.c
+@@ -9,7 +9,7 @@
+ #include <dxgi.h>
+ #endif
+ 
+-#if !defined(_WIN32) && !defined(__APPLE__)
++#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__ANDROID__)
+ #include "vaapi-utils.h"
+ 
+ #define LIBAVUTIL_VAAPI_AVAILABLE
+diff --git a/plugins/rtmp-services/CMakeLists.txt b/plugins/rtmp-services/CMakeLists.txt
+index be0364c..474ffa7 100644
+--- a/plugins/rtmp-services/CMakeLists.txt
++++ b/plugins/rtmp-services/CMakeLists.txt
+@@ -11,7 +11,7 @@ set(
+ )
+ mark_as_advanced(RTMP_SERVICES_URL)
+ 
+-if(NOT TARGET OBS::file-updater)
++if(ENABLE_SERVICE_UPDATES AND NOT TARGET OBS::file-updater)
+   add_subdirectory("${CMAKE_SOURCE_DIR}/shared/file-updater" "${CMAKE_BINARY_DIR}/shared/file-updater")
+ endif()
+ 
+@@ -31,22 +31,27 @@ target_sources(
+     service-specific/amazon-ivs.h
+     service-specific/dacast.c
+     service-specific/dacast.h
+-    service-specific/nimotv.c
++    $<$<BOOL:${ENABLE_SERVICE_UPDATES}>:service-specific/nimotv.c>
+     service-specific/nimotv.h
+     service-specific/service-ingest.c
+     service-specific/service-ingest.h
+-    service-specific/showroom.c
++    $<$<BOOL:${ENABLE_SERVICE_UPDATES}>:service-specific/showroom.c>
+     service-specific/showroom.h
+     service-specific/twitch.c
+     service-specific/twitch.h
++    $<$<NOT:$<BOOL:${ENABLE_SERVICE_UPDATES}>>:file-updater-stub.c>
+ )
+ 
++if(NOT ENABLE_SERVICE_UPDATES)
++  target_include_directories(rtmp-services PRIVATE "${CMAKE_SOURCE_DIR}/shared/file-updater")
++endif()
++
+ target_compile_definitions(
+   rtmp-services
+   PRIVATE SERVICES_URL="${RTMP_SERVICES_URL}" $<$<BOOL:${ENABLE_SERVICE_UPDATES}>:ENABLE_SERVICE_UPDATES>
+ )
+ 
+-target_link_libraries(rtmp-services PRIVATE OBS::libobs OBS::file-updater jansson::jansson)
++target_link_libraries(rtmp-services PRIVATE OBS::libobs $<$<BOOL:${ENABLE_SERVICE_UPDATES}>:OBS::file-updater> jansson::jansson)
+ 
+ # Remove once jansson has been fixed on obs-deps
+ target_link_options(rtmp-services PRIVATE $<$<PLATFORM_ID:Windows>:/IGNORE:4098>)
+diff --git a/plugins/text-freetype2/CMakeLists.txt b/plugins/text-freetype2/CMakeLists.txt
+index 955cb73..5340164 100644
+--- a/plugins/text-freetype2/CMakeLists.txt
++++ b/plugins/text-freetype2/CMakeLists.txt
+@@ -23,6 +23,7 @@ target_sources(
+     $<$<PLATFORM_ID:Darwin>:find-font-cocoa.m>
+     $<$<PLATFORM_ID:Darwin>:find-font-iconv.c>
+     $<$<PLATFORM_ID:Linux,FreeBSD,OpenBSD>:find-font-unix.c>
++    $<$<PLATFORM_ID:Android>:find-font-android.c>
+     $<$<PLATFORM_ID:Windows,Darwin>:find-font.c>
+     $<$<PLATFORM_ID:Windows>:find-font-windows.c>
+     find-font.h
+@@ -41,6 +42,7 @@ target_link_libraries(
+     $<$<PLATFORM_ID:Darwin>:Iconv::Iconv>
+     "$<$<PLATFORM_ID:Darwin>:$<LINK_LIBRARY:FRAMEWORK,Cocoa.framework>>"
+     $<$<PLATFORM_ID:Linux,FreeBSD,OpenBSD>:Fontconfig::Fontconfig>
++    $<$<PLATFORM_ID:Android>:z>
+ )
+ 
+ # FreeType is hard-coded with /DEFAULTLIB:MSVCRT
+diff --git a/plugins/text-freetype2/text-freetype2.c b/plugins/text-freetype2/text-freetype2.c
+index 0e92bf0..9f18d68 100644
+--- a/plugins/text-freetype2/text-freetype2.c
++++ b/plugins/text-freetype2/text-freetype2.c
+@@ -219,7 +219,7 @@ static void ft2_source_destroy(void *data)
+ {
+ 	struct ft2_source *srcdata = data;
+ 
+-	if (srcdata->font_face != NULL) {
++	if (ft2_lib != NULL && srcdata->font_face != NULL) {
+ 		FT_Done_Face(srcdata->font_face);
+ 		srcdata->font_face = NULL;
+ 	}
+@@ -323,7 +323,7 @@ static bool init_font(struct ft2_source *srcdata)
+ 	if (!path)
+ 		return false;
+ 
+-	if (srcdata->font_face != NULL) {
++	if (ft2_lib != NULL && srcdata->font_face != NULL) {
+ 		FT_Done_Face(srcdata->font_face);
+ 		srcdata->font_face = NULL;
+ 	}
+diff --git a/shared/media-playback/CMakeLists.txt b/shared/media-playback/CMakeLists.txt
+index c57a7bc..1f574cc 100644
+--- a/shared/media-playback/CMakeLists.txt
++++ b/shared/media-playback/CMakeLists.txt
+@@ -1,6 +1,10 @@
+ cmake_minimum_required(VERSION 3.28...3.30)
+ 
+-find_package(FFmpeg 8.0 REQUIRED avcodec avdevice avutil avformat)
++if(OS_ANDROID)
++  find_package(FFmpeg 8.0 REQUIRED avcodec avutil avformat)
++else()
++  find_package(FFmpeg 8.0 REQUIRED avcodec avdevice avutil avformat)
++endif()
+ 
+ add_library(media-playback INTERFACE)
+ add_library(OBS::media-playback ALIAS media-playback)
+@@ -21,4 +25,4 @@ target_sources(
+ 
+ target_include_directories(media-playback INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}")
+ 
+-target_link_libraries(media-playback INTERFACE FFmpeg::avcodec FFmpeg::avdevice FFmpeg::avutil FFmpeg::avformat)
++target_link_libraries(media-playback INTERFACE FFmpeg::avcodec $<$<NOT:$<BOOL:${OS_ANDROID}>>:FFmpeg::avdevice> FFmpeg::avutil FFmpeg::avformat)
+diff --git a/shared/media-playback/media-playback/media.c b/shared/media-playback/media-playback/media.c
+index 9211fce..a841dfa 100644
+--- a/shared/media-playback/media-playback/media.c
++++ b/shared/media-playback/media-playback/media.c
+@@ -22,7 +22,9 @@
+ #include "media.h"
+ #include "closest-format.h"
+ 
++#ifndef __ANDROID__
+ #include <libavdevice/avdevice.h>
++#endif
+ #include <libavutil/imgutils.h>
+ 
+ static int64_t base_sys_ts = 0;
+@@ -896,7 +898,9 @@ bool mp_media_init(mp_media_t *media, const struct mp_media_info *info)
+ 
+ 	static bool initialized = false;
+ 	if (!initialized) {
++#ifndef __ANDROID__
+ 		avdevice_register_all();
++#endif
+ 		avformat_network_init();
+ 		initialized = true;
+ 	}

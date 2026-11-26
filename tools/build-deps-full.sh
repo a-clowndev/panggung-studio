@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SDK_DIR="${ANDROID_HOME:-$HOME/Android/Sdk}"
 NDK_DIR="${ANDROID_NDK_HOME:-$SDK_DIR/ndk/28.2.13676358}"
 CMAKE_BIN="$SDK_DIR/cmake/4.1.2/bin/cmake"
+[ -x "$CMAKE_BIN" ] || CMAKE_BIN="$(command -v cmake)"
 
 ABI="arm64-v8a"
 API=29
@@ -43,6 +44,10 @@ CMAKE_COMMON=(
 )
 
 echo "=== T-D01: Cross-Compiling Full Android Native Deps ($ABI, API $API) ==="
+
+# Ensure base deps (SIMDe, uthash, jansson, mbedTLS, FFmpeg src) & Phase 1 deps (FreeType, x264) exist first
+FFMPEG_SKIP_BUILD=1 "$ROOT_DIR/tools/build-deps.sh"
+"$ROOT_DIR/tools/build-deps-p1.sh"
 
 # 1. libjpeg-turbo 3.1.0 (UVC MJPEG NEON acceleration)
 if [ ! -f "$PREFIX/lib/libturbojpeg.a" ]; then

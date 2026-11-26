@@ -89,7 +89,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: native/deps/install
-          key: panggung-deps-arm64-${{ hashFiles('tools/build-deps-full.sh') }}
+          key: panggung-deps-arm64-v2-${{ hashFiles('tools/build-deps*.sh') }}
 
       - name: Build native dependencies (FFmpeg, x264, x265, libaom, libsrt, SpeexDSP)
         if: steps.cache-deps.outputs.cache-hit != 'true'

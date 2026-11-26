@@ -5,6 +5,10 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SDK_DIR="${ANDROID_HOME:-$HOME/Android/Sdk}"
 NDK_DIR="${ANDROID_NDK_HOME:-$SDK_DIR/ndk/28.2.13676358}"
 CMAKE_BIN="$SDK_DIR/cmake/4.1.2/bin/cmake"
+[ -x "$CMAKE_BIN" ] || CMAKE_BIN="$(command -v cmake)"
+TOOLCHAIN="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64"
+CC="$TOOLCHAIN/bin/aarch64-linux-android29-clang"
+STRIP="$TOOLCHAIN/bin/llvm-strip"
 
 ABI="arm64-v8a"
 API=29
@@ -17,6 +21,13 @@ JOBS="$(nproc)"
 export PATH="$SDK_DIR/cmake/4.1.2/bin:$PATH"
 export PKG_CONFIG_LIBDIR="$DEPS_PREFIX/lib/pkgconfig"
 export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig"
+
+echo "=== Ensuring OBS Studio 33.0.3 source + Android patches ==="
+if [ ! -d "$OBS_SRC/.git" ]; then
+    git clone --depth 1 --branch 33.0.3 https://github.com/obsproject/obs-studio.git "$OBS_SRC"
+    git -C "$OBS_SRC" apply "$ROOT_DIR/native/obs-android-patches/obs-33.0.3-android.patch"
+    cp -a "$ROOT_DIR/native/obs-android-patches/overlay/." "$OBS_SRC/"
+fi
 
 echo "=== Configuring libobs + core modules for Android $ABI (API $API) ==="
 
@@ -77,5 +88,35 @@ echo "=== Building libobs + core modules ==="
 "$CMAKE_BIN" --build "$OBS_BUILD" --target libobs libobs-gles obs-android-plugins image-source obs-filters obs-transitions obs-outputs obs-ffmpeg rtmp-services text-freetype2 obs-x264 -j "$JOBS"
 "$CMAKE_BIN" --install "$OBS_BUILD"
 
+echo "=== Building Panggung 3rd-party plugin pack & frontend API shim ==="
+JNI_OUT="$ROOT_DIR/app/src/main/jniLibs/$ABI"
+ASSETS_OBS="$ROOT_DIR/app/src/main/assets/obs"
+mkdir -p "$JNI_OUT" "$ASSETS_OBS"
+
+"$CC" -shared -fPIC -O2 -Wl,-z,max-page-size=16384 \
+    -I"$OBS_INSTALL/include" -I"$OBS_SRC/libobs" -I"$OBS_BUILD/config" -I"$DEPS_PREFIX/include" \
+    "$ROOT_DIR/native/android-plugins/obs-frontend-api-shim.c" \
+    -L"$OBS_INSTALL/lib" -lobs -llog \
+    -Wl,-soname,libobs-frontend-api.so \
+    -o "$JNI_OUT/libobs-frontend-api.so"
+
+"$CC" -shared -fPIC -O2 -Wl,-z,max-page-size=16384 \
+    -I"$OBS_INSTALL/include" -I"$OBS_SRC/libobs" -I"$OBS_BUILD/config" -I"$DEPS_PREFIX/include" \
+    "$ROOT_DIR/native/android-plugins/panggung-3p-pack.c" \
+    -L"$OBS_INSTALL/lib" -lobs -llog -lm \
+    -Wl,-soname,libobs-mod-panggung-3p-pack.so \
+    -o "$JNI_OUT/libobs-mod-panggung-3p-pack.so"
+
+echo "=== Packaging shared libraries into app/src/main/jniLibs/$ABI ==="
+cp -f "$DEPS_PREFIX/lib/"lib{avcodec,avfilter,avformat,avutil,swresample,swscale}.so "$JNI_OUT/"
+cp -f "$OBS_INSTALL/lib/"libobs*.so "$JNI_OUT/"
+cp -f "$OBS_INSTALL/lib/obs-modules/core/"libobs-mod-*.so "$JNI_OUT/"
+"$STRIP" --strip-unneeded "$JNI_OUT/"*.so || true
+
+echo "=== Packaging OBS runtime assets into app/src/main/assets/obs ==="
+if [ -d "$OBS_INSTALL/share/obs" ]; then
+    cp -a "$OBS_INSTALL/share/obs/." "$ASSETS_OBS/"
+fi
+
 echo "=== Build complete ==="
-ls -lh "$OBS_INSTALL/lib" "$OBS_INSTALL/lib/obs-modules/core" 2>/dev/null || true
+ls -lh "$JNI_OUT" 2>/dev/null || true

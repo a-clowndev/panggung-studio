@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SDK_DIR="${ANDROID_HOME:-$HOME/Android/Sdk}"
 NDK_DIR="${ANDROID_NDK_HOME:-$SDK_DIR/ndk/28.2.13676358}"
 CMAKE_BIN="$SDK_DIR/cmake/4.1.2/bin/cmake"
+[ -x "$CMAKE_BIN" ] || CMAKE_BIN="$(command -v cmake)"
 
 ABI="arm64-v8a"
 API=29

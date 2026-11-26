@@ -5,7 +5,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SDK_DIR="${ANDROID_HOME:-$HOME/Android/Sdk}"
 NDK_DIR="${ANDROID_NDK_HOME:-$SDK_DIR/ndk/28.2.13676358}"
 CMAKE_BIN="$SDK_DIR/cmake/4.1.2/bin/cmake"
+[ -x "$CMAKE_BIN" ] || CMAKE_BIN="$(command -v cmake)"
 NINJA_BIN="$SDK_DIR/cmake/4.1.2/bin/ninja"
+[ -x "$NINJA_BIN" ] || NINJA_BIN="$(command -v ninja)"
 
 ABI="arm64-v8a"
 API=29
@@ -109,11 +111,12 @@ if [ ! -f "$PREFIX/lib/libmbedtls.a" ]; then
 fi
 
 # 5. FFmpeg 8.1.3 (shared libs with Android MediaCodec + JNI)
-if [ ! -f "$PREFIX/lib/libavcodec.so" ]; then
+if [ ! -d "$DEPS_SRC/ffmpeg" ]; then
+    echo ">>> [5/5] Cloning FFmpeg n8.1.3..."
+    git clone --depth 1 --branch n8.1.3 https://github.com/FFmpeg/FFmpeg.git "$DEPS_SRC/ffmpeg"
+fi
+if [ "${FFMPEG_SKIP_BUILD:-0}" != "1" ] && [ ! -f "$PREFIX/lib/libavcodec.so" ]; then
     echo ">>> [5/5] Building FFmpeg n8.1.3..."
-    if [ ! -d "$DEPS_SRC/ffmpeg" ]; then
-        git clone --depth 1 --branch n8.1.3 https://github.com/FFmpeg/FFmpeg.git "$DEPS_SRC/ffmpeg"
-    fi
     mkdir -p "$DEPS_BUILD/ffmpeg"
     pushd "$DEPS_BUILD/ffmpeg" >/dev/null
     "$DEPS_SRC/ffmpeg/configure" \
