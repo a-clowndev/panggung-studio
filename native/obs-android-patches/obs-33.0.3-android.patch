@@ -320,10 +320,22 @@ index 5648ca6..cfe79b1 100644
  	return out;
  }
 diff --git a/plugins/CMakeLists.txt b/plugins/CMakeLists.txt
-index 397b703..93165bd 100644
+index 397b703..d56d030 100644
 --- a/plugins/CMakeLists.txt
 +++ b/plugins/CMakeLists.txt
-@@ -107,7 +107,10 @@ add_core_module(obs-webrtc)
+@@ -35,7 +35,10 @@ macro(check_obs_browser)
+ endmacro()
+ 
+ macro(check_obs_websocket)
+-  if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/obs-websocket/CMakeLists.txt")
++  if(OS_ANDROID OR (DEFINED ENABLE_WEBSOCKET AND NOT ENABLE_WEBSOCKET))
++    add_custom_target(obs-websocket)
++    target_disable(obs-websocket)
++  elseif(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/obs-websocket/CMakeLists.txt")
+     message(FATAL_ERROR "Required submodule 'obs-websocket' not available.")
+   else()
+     add_core_module(obs-websocket)
+@@ -107,7 +110,10 @@ add_core_module(obs-webrtc)
  
  check_obs_websocket()
  
