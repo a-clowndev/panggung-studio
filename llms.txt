@@ -1,0 +1,25 @@
+# Panggung Studio
+
+> Standalone open-source live streaming and screen recording studio for Android (`arm64-v8a`, Android 10–17), powered by cross-compiled `libobs 33.0.3`, custom OpenGL ES 3.2 zero-copy compositor (`libobs-gles`), FFmpeg 8.1.3, Rust (`panggung-core`), and Jetpack Compose. No PC required.
+
+## Core Facts
+- **Repository**: `https://github.com/a-clowndev/panggung-studio`
+- **Application ID**: `io.panggung.obs`
+- **Current Version**: `v0.1.0`
+- **License**: `GPL-2.0-or-later`
+- **Platform**: Android 10+ (API 29+, Target SDK 35, hardware-verified on Android 17 / `SM-S721B` Galaxy S24 FE)
+- **Architecture**: `arm64-v8a`
+- **Primary Use Cases**: Standalone mobile live streaming (TikTok Live 9:16 vertical, YouTube Live, Twitch, RTMP/RTMPS/SRT), mobile gaming broadcast with in-game floating controls and facecam PiP, local Hybrid MP4 10-bit HDR recording, and `obs-websocket v5` remote studio control.
+
+## Key Technical Differentiators
+- **True `libobs 33.0.3` Engine on Android**: Full scene/source compositing, Studio Mode T-Bar, Fade-to-Black, filters, SpeexDSP noise suppression, Stereo VU meters, and Lua 5.4 scripting directly on Android.
+- **Zero-Copy GLES 3.2 & 10-bit HDR**: `AHardwareBuffer` -> `EGLImageKHR` + `EGLSyncKHR` texture import, `P010` / `GL_RGBA16F` Rec. 2100 PQ & HLG compositing, and hardware `MediaCodec` H.264 / HEVC / HEVC Main10 HDR / AV1 / VP9 encoding.
+- **Background-Alive In-Game Camera & Proportional Screen Capture**: Combined `CAMERA | MICROPHONE | MEDIA_PROJECTION` Foreground Service (`FGS=224`) prevents Android 14–17 camera disconnects while gaming, paired with proportional `VirtualDisplay` resizing and `AudioPlaybackCapture` internal game audio.
+- **In-Game Floating Studio Hub**: Draggable `● LIVE` overlay pill with 1-tap `REC`, `MIC`, `CAM` (drag position, corner `◢` / `S`/`M`/`L` resize, `FRONT`/`BACK` flip, `90°` rotate, H/V mirror), `LAYOUT` (`SPLIT 2`, `3-SLOT`, `GAME+PiP`, `FULL CAM`), and `SCENE` switching.
+- **100% 3-Tier UI Parity**: Phone Portrait, Compact 3-Column Landscape, and Tablet / Samsung DeX Full-Sidebar.
+
+## Documentation
+- [README (English)](README.md): Overview, features, quick start, verified benchmarks, and FAQ.
+- [README (Bahasa Indonesia)](README_ID.md): Dokumentasi lengkap Bahasa Indonesia.
+- [Build & Test Guide](BUILDING.md): Cross-compiling native deps, `libobs`, Rust `panggung-core`, Gradle APK, and E2E tests.
+- [Changelog](CHANGELOG.md): Release notes and version history.

@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Four precision viewfinder corner brackets (Deep Teal #14B8A6) inside 66dp safe zone (21..87) -->
+    <path
+        android:strokeColor="#14B8A6"
+        android:strokeWidth="3.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M27,40 L27,29 Q27,27 29,27 L40,27" />
+    <path
+        android:strokeColor="#14B8A6"
+        android:strokeWidth="3.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M68,27 L79,27 Q81,27 81,29 L81,40" />
+    <path
+        android:strokeColor="#14B8A6"
+        android:strokeWidth="3.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M27,68 L27,79 Q27,81 29,81 L40,81" />
+    <path
+        android:strokeColor="#14B8A6"
+        android:strokeWidth="3.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M68,81 L79,81 Q81,81 81,79 L81,68" />
+
+    <!-- Architectural "P" Stage / Broadcast Aperture Mark (Crisp White #F1F5F9) -->
+    <path
+        android:fillColor="#F1F5F9"
+        android:pathData="M39,35 L58,35 C66.5,35 71,39.8 71,47.5 C71,55.2 66.5,60 58,60 L47,60 L47,73 L39,73 Z M47,42.5 L47,52.5 L57,52.5 C61.2,52.5 63.2,50.7 63.2,47.5 C63.2,44.3 61.2,42.5 57,42.5 Z" />
+
+    <!-- Broadcast Live Tally Dot (Signal Red #EF4444) -->
+    <path
+        android:fillColor="#EF4444"
+        android:pathData="M65,67 m-5.5,0 a5.5,5.5 0,1 0,11 0 a5.5,5.5 0,1 0,-11 0" />
+</vector>

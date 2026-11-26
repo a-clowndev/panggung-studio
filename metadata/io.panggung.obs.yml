@@ -1,0 +1,32 @@
+Categories:
+  - Multimedia
+License: GPL-2.0-or-later
+AuthorName: Panggung Studio Contributors
+SourceCode: https://github.com/panggung-studio/panggung-studio
+IssueTracker: https://github.com/panggung-studio/panggung-studio/issues
+
+AutoName: Panggung Studio
+Summary: Standalone mobile broadcast & recording studio powered by libobs
+Description: |-
+  Panggung Studio is an open-source, standalone Android broadcast and recording
+  studio built on top of libobs (OBS Studio 33.0.3) with an EGL/OpenGL ES 3.2
+  renderer, hardware MediaCodec H.264/HEVC and software x264 encoders, Studio Mode,
+  scene transitions, video/audio filters, Replay Buffer, obs-websocket v5, built-in
+  Web Remote UI, embedded Lua scripting (obslua), and sideloadable .pgplugin support.
+
+RepoType: git
+Repo: https://github.com/panggung-studio/panggung-studio.git
+
+Builds:
+  - versionName: 1.0.0
+    versionCode: 1
+    commit: main
+    subdir: app
+    gradle:
+      - yes
+    ndk: 28.2.13676358
+
+AutoUpdateMode: Version
+UpdateCheckMode: Tags
+CurrentVersion: 1.0.0
+CurrentVersionCode: 1

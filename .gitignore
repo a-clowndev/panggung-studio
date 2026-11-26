@@ -1,0 +1,84 @@
+# ==============================================================================
+# Panggung Studio — .gitignore
+# ==============================================================================
+
+# Secrets & Android Release Signing (NEVER commit)
+*.jks
+*.keystore
+*.p12
+*.pem
+keystore.properties
+local.properties
+.env
+.env.*
+
+# Rust / Cargo build outputs
+/target/
+
+# Native upstream sources, cross-compiled deps & build artifacts
+/native/obs-studio/
+/native/deps/src/
+/native/deps/build/
+/native/deps/install/
+/native/build/
+/native/install/
+/app/src/main/jniLibs/
+/app/src/main/assets/obs/
+
+# Gradle / Kotlin / Android build caches & outputs
+/tools/gradle/
+/.gradle/
+/.kotlin/
+/app/build/
+/build/
+/captures/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+*.hprof
+
+# Native compiled binaries & objects
+*.o
+*.lo
+*.a
+*.la
+*.so
+*.dylib
+
+# IDE & Editor files
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python tests & virtualenvs
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+
+# Temporary media, recordings, streams & logs
+*.mp4
+*.mkv
+*.flv
+*.ts
+*.m3u8
+*.ppm
+*.log
+
+# Internal planning, research & design scratch (do not publish)
+/docs/
+/design/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini

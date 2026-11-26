@@ -1,0 +1,21 @@
+[package]
+name = "panggung-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "panggung"
+crate-type = ["cdylib"]
+
+[dependencies]
+obs = { path = "../obs" }
+obs-sys = { path = "../obs-sys" }
+jni.workspace = true
+log.workspace = true
+android_logger.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tungstenite = "0.26"
+mlua = { version = "0.10", features = ["lua54", "vendored"] }

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- AntiSlopUI Deep Broadcast Darkroom Slate -->
+    <path
+        android:fillColor="#0D1117"
+        android:pathData="M0,0h108v108h-108z" />
+    <!-- Subtle inner stage card -->
+    <path
+        android:fillColor="#131922"
+        android:pathData="M14,14h80a0,0 0,0 1,0 0v80a0,0 0,0 1,0 0h-80a0,0 0,0 1,0 0v-80a0,0 0,0 1,0 0z" />
+</vector>

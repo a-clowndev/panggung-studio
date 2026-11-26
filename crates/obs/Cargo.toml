@@ -1,0 +1,10 @@
+[package]
+name = "obs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+obs-sys = { path = "../obs-sys" }
+thiserror.workspace = true
+log.workspace = true

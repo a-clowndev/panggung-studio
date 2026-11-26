@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" width="512" height="512">
+  <rect width="108" height="108" rx="24" fill="#0D1117" />
+  <rect x="4" y="4" width="100" height="100" rx="20" fill="none" stroke="#2D3643" stroke-width="1.5" />
+  <!-- Viewfinder brackets -->
+  <path d="M23,37 L23,25 Q23,23 25,23 L37,23" fill="none" stroke="#14B8A6" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round" />
+  <path d="M71,23 L83,23 Q85,23 85,25 L85,37" fill="none" stroke="#14B8A6" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round" />
+  <path d="M23,71 L23,83 Q23,85 25,85 L37,85" fill="none" stroke="#14B8A6" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round" />
+  <path d="M71,85 L83,85 Q85,85 85,83 L85,71" fill="none" stroke="#14B8A6" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round" />
+  <!-- Geometric P Broadcast Mark -->
+  <path d="M36,33 L58,33 C67.2,33 72,38.2 72,46.8 C72,55.4 67.2,60.6 58,60.6 L45,60.6 L45,75 L36,75 Z M45,41.2 L45,52.4 L56.8,52.4 C61.4,52.4 63.6,50.4 63.6,46.8 C63.6,43.2 61.4,41.2 56.8,41.2 Z" fill="#F1F5F9" />
+  <!-- Live Tally Dot -->
+  <circle cx="66" cy="69" r="6" fill="#EF4444" />
+</svg>
