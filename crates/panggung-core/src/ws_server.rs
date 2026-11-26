@@ -1,8 +1,15 @@
+use std::fs::File;
+use std::io::Read;
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::thread;
+use std::time::Duration;
 
 use log::{error, info, warn};
 use serde_json::{Value, json};
+use tungstenite::protocol::frame::coding::CloseCode;
+use tungstenite::protocol::CloseFrame;
 use tungstenite::{Message, accept};
 
 use crate::{
@@ -15,30 +22,88 @@ use crate::{
     ws_switch_scene_by_name, ws_trigger_studio_transition, ws_update_source_settings,
 };
 
-pub fn spawn_obs_websocket_server(port: u16) {
+static WS_RUNNING: AtomicBool = AtomicBool::new(false);
+static WS_LAN_ACCESS: AtomicBool = AtomicBool::new(false);
+static WS_GENERATION: AtomicU64 = AtomicU64::new(0);
+static WS_AUTH_TOKEN: Mutex<String> = Mutex::new(String::new());
+
+pub fn is_running() -> bool {
+    WS_RUNNING.load(Ordering::SeqCst)
+}
+
+pub fn is_lan_enabled() -> bool {
+    WS_LAN_ACCESS.load(Ordering::SeqCst)
+}
+
+pub fn current_auth_token() -> String {
+    WS_AUTH_TOKEN.lock().unwrap().clone()
+}
+
+pub fn stop_obs_websocket_server() {
+    WS_RUNNING.store(false, Ordering::SeqCst);
+    WS_GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Start obs-websocket v5 server with mandatory SHA-256 challenge-response authentication.
+/// Disabled by default; binds 127.0.0.1 unless `lan_access` is explicitly true.
+pub fn start_obs_websocket_server(port: u16, lan_access: bool, auth_token: &str) -> bool {
+    if auth_token.len() < 8 {
+        error!("Refusing to start obs-websocket without a strong auth token (>= 8 chars)");
+        return false;
+    }
+    stop_obs_websocket_server();
+    // Brief yield so previous non-blocking listener releases the port
+    thread::sleep(Duration::from_millis(120));
+
+    {
+        let mut tok = WS_AUTH_TOKEN.lock().unwrap();
+        *tok = auth_token.to_string();
+    }
+    WS_LAN_ACCESS.store(lan_access, Ordering::SeqCst);
+    let generation = WS_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    let bind_host = if lan_access { "0.0.0.0" } else { "127.0.0.1" };
+    let addr = format!("{bind_host}:{port}");
+    let listener = match TcpListener::bind(&addr) {
+        Ok(l) => {
+            let _ = l.set_nonblocking(true);
+            info!("obs-websocket v5 server listening on ws://{addr} (auth=REQUIRED, lan={lan_access})");
+            l
+        }
+        Err(e) => {
+            error!("Failed to bind obs-websocket on {addr}: {e}");
+            return false;
+        }
+    };
+
+    WS_RUNNING.store(true, Ordering::SeqCst);
+    let expected_token = auth_token.to_string();
+
     thread::Builder::new()
         .name("obs-ws-v5".into())
         .spawn(move || {
-            let addr = format!("0.0.0.0:{port}");
-            let listener = match TcpListener::bind(&addr) {
-                Ok(l) => {
-                    info!("obs-websocket v5 server listening on ws://{addr}");
-                    l
+            while WS_RUNNING.load(Ordering::SeqCst) && WS_GENERATION.load(Ordering::SeqCst) == generation {
+                match listener.accept() {
+                    Ok((stream, _peer)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let tok = expected_token.clone();
+                        thread::spawn(move || handle_client(stream, &tok));
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(80));
+                    }
+                    Err(e) => {
+                        warn!("obs-websocket accept error: {e}");
+                        thread::sleep(Duration::from_millis(100));
+                    }
                 }
-                Err(e) => {
-                    error!("Failed to bind obs-websocket on {addr}: {e}");
-                    return;
-                }
-            };
-
-            for stream in listener.incoming().flatten() {
-                thread::spawn(move || handle_client(stream));
             }
+            info!("obs-websocket v5 server stopped");
         })
-        .ok();
+        .is_ok()
 }
 
-fn handle_client(stream: std::net::TcpStream) {
+fn handle_client(stream: std::net::TcpStream, password: &str) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
     let mut ws = match accept(stream) {
         Ok(w) => w,
         Err(e) => {
@@ -47,18 +112,28 @@ fn handle_client(stream: std::net::TcpStream) {
         }
     };
 
-    // OpCode 0: Hello (obs-websocket v5.5.0, no auth required by default on local LAN)
+    let challenge = random_b64(24);
+    let salt = random_b64(24);
+    let expected_auth = compute_obs_ws_auth(password, &salt, &challenge);
+
+    // OpCode 0: Hello (obs-websocket v5.5.0 with mandatory authentication)
     let hello = json!({
         "op": 0,
         "d": {
             "obsStudioVersion": obs::ObsContext::version_string(),
             "obsWebSocketVersion": "5.5.0",
-            "rpcVersion": 1
+            "rpcVersion": 1,
+            "authentication": {
+                "challenge": challenge,
+                "salt": salt
+            }
         }
     });
     if ws.send(Message::Text(hello.to_string().into())).is_err() {
         return;
     }
+
+    let mut identified = false;
 
     while let Ok(msg) = ws.read() {
         let Message::Text(txt) = msg else { continue };
@@ -67,16 +142,36 @@ fn handle_client(stream: std::net::TcpStream) {
         let d = v.get("d").cloned().unwrap_or(Value::Null);
 
         match op {
-            // OpCode 1: Identify -> reply OpCode 2: Identified
+            // OpCode 1: Identify -> verify SHA-256 challenge-response -> reply OpCode 2: Identified
             1 => {
-                let identified = json!({
+                let provided = d.get("authentication").and_then(|x| x.as_str()).unwrap_or("");
+                if !constant_time_eq(provided.as_bytes(), expected_auth.as_bytes()) {
+                    warn!("obs-websocket authentication failed — closing connection (4009)");
+                    let _ = ws.close(Some(CloseFrame {
+                        code: CloseCode::Library(4009),
+                        reason: "Authentication failed".into(),
+                    }));
+                    return;
+                }
+                identified = true;
+                let identified_msg = json!({
                     "op": 2,
                     "d": { "negotiatedRpcVersion": 1 }
                 });
-                let _ = ws.send(Message::Text(identified.to_string().into()));
+                if ws.send(Message::Text(identified_msg.to_string().into())).is_err() {
+                    return;
+                }
             }
-            // OpCode 6: Request -> reply OpCode 7: RequestResponse
+            // OpCode 6: Request -> strictly require identified == true
             6 => {
+                if !identified {
+                    warn!("obs-websocket unauthenticated request rejected (4007)");
+                    let _ = ws.close(Some(CloseFrame {
+                        code: CloseCode::Library(4007),
+                        reason: "Not identified".into(),
+                    }));
+                    return;
+                }
                 let req_type = d.get("requestType").and_then(|x| x.as_str()).unwrap_or("");
                 let req_id = d.get("requestId").and_then(|x| x.as_str()).unwrap_or("");
                 let req_data = d.get("requestData").cloned().unwrap_or(Value::Null);
@@ -94,7 +189,9 @@ fn handle_client(stream: std::net::TcpStream) {
                         "responseData": resp_data
                     }
                 });
-                let _ = ws.send(Message::Text(resp.to_string().into()));
+                if ws.send(Message::Text(resp.to_string().into())).is_err() {
+                    return;
+                }
             }
             _ => {}
         }
@@ -279,6 +376,9 @@ fn dispatch_request(req_type: &str, data: &Value) -> (bool, Value) {
         "RemuxRecording" => {
             let src = data.get("srcPath").and_then(|x| x.as_str()).unwrap_or("");
             let dst = data.get("dstPath").and_then(|x| x.as_str()).unwrap_or("");
+            if src.contains("..") || dst.contains("..") {
+                return (false, json!({ "error": "Invalid path" }));
+            }
             (ws_remux_to_mp4(src, dst), json!({}))
         }
         "StartMultistream" => {
@@ -301,23 +401,15 @@ fn dispatch_request(req_type: &str, data: &Value) -> (bool, Value) {
             ws_stop_custom_output();
             (true, json!({}))
         }
-        "RunLuaScript" => {
-            let label = data.get("label").and_then(|x| x.as_str()).unwrap_or("remote.lua");
-            let code = data.get("code").and_then(|x| x.as_str()).unwrap_or("");
-            match crate::lua_engine::run_lua_code(label, code) {
-                Ok(desc) => (true, json!({ "description": desc })),
-                Err(e) => (false, json!({ "error": e })),
-            }
-        }
+        // SECURITY: Arbitrary Lua execution & native .so plugin loading are strictly blocked over remote API.
+        "RunLuaScript" | "LoadPluginSo" => (
+            false,
+            json!({ "error": "Blocked over remote API for security. Run scripts and plugins locally in-app." }),
+        ),
         "GetScriptList" => {
             let raw = crate::lua_engine::list_scripts_json();
             let v: Value = serde_json::from_str(&raw).unwrap_or(json!([]));
             (true, json!({ "scripts": v }))
-        }
-        "LoadPluginSo" => {
-            let so = data.get("soPath").and_then(|x| x.as_str()).unwrap_or("");
-            let dp = data.get("dataPath").and_then(|x| x.as_str()).unwrap_or("");
-            (crate::ws_load_plugin_so(so, dp), json!({}))
         }
         "ToggleDualCanvas" => {
             let en = data.get("enabled").and_then(|x| x.as_bool()).unwrap_or(false);
@@ -333,9 +425,14 @@ fn dispatch_request(req_type: &str, data: &Value) -> (bool, Value) {
                 let bw = state.base_width;
                 let bh = state.base_height;
                 let scene = state.scenes[idx].scene;
-                let added = crate::add_source_to_scene(scene, kind, name, Some(&settings), bw, bh);
-                if added { state.scenes[idx].sources.push(name.to_string()); }
-                added
+                if let Some(actual_name) = crate::add_source_to_scene(scene, kind, name, Some(&settings), bw, bh) {
+                    if !state.scenes[idx].sources.contains(&actual_name) {
+                        state.scenes[idx].sources.push(actual_name);
+                    }
+                    true
+                } else {
+                    false
+                }
             } else { false };
             (ok, json!({}))
         }
@@ -427,5 +524,168 @@ fn dispatch_request(req_type: &str, data: &Value) -> (bool, Value) {
             (crate::studio_ops::ws_delete_scene(idx), json!({}))
         }
         _ => (false, json!({})),
+    }
+}
+
+/* ---------- Zero-Dependency RFC 6234 SHA-256 + Base64 + CSPRNG ---------- */
+
+pub fn compute_obs_ws_auth(password: &str, salt: &str, challenge: &str) -> String {
+    let mut s1 = Vec::with_capacity(password.len() + salt.len());
+    s1.extend_from_slice(password.as_bytes());
+    s1.extend_from_slice(salt.as_bytes());
+    let secret = base64_encode(&sha256(&s1));
+
+    let mut s2 = Vec::with_capacity(secret.len() + challenge.len());
+    s2.extend_from_slice(secret.as_bytes());
+    s2.extend_from_slice(challenge.as_bytes());
+    base64_encode(&sha256(&s2))
+}
+
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+pub fn random_b64(num_bytes: usize) -> String {
+    let mut buf = vec![0u8; num_bytes];
+    if let Ok(mut f) = File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut buf);
+    } else {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(1);
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = ((nanos >> ((i % 16) * 8)) ^ (i as u128 * 37)) as u8;
+        }
+    }
+    base64_encode(&buf)
+}
+
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while (msg.len() % 64) != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in msg.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([chunk[4 * i], chunk[4 * i + 1], chunk[4 * i + 2], chunk[4 * i + 3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g; g = f; f = e; e = d.wrapping_add(t1);
+            d = c; c = b; b = a; a = t1.wrapping_add(t2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+    let mut out = [0u8; 32];
+    for (i, word) in h.iter().enumerate() {
+        out[4 * i..4 * i + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+pub fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { TABLE[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_rfc6234_vectors() {
+        let empty = sha256(b"");
+        let empty_hex: String = empty.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(empty_hex, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+
+        let abc = sha256(b"abc");
+        let abc_hex: String = abc.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(abc_hex, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    #[test]
+    fn obs_ws_v5_official_auth_vector() {
+        // Official obs-websocket v5 protocol specification test vector
+        let auth = compute_obs_ws_auth(
+            "supersecretpassword",
+            "lM1GncleQOaCu9lT1yeUZhFYnqhsLLP1G5lAGo3ixaI=",
+            "+IxH4CnCiqpX1rM9scsNynZzbOe4KhDeYcTNS3PDaeY=",
+        );
+        assert_eq!(auth, "1Ct943GAT+6YQUUX47Ia/ncufilbe6+oD6lY+5kaCu4=");
+    }
+
+    #[test]
+    fn security_invariants() {
+        assert!(!is_running(), "Remote server must be disabled by default");
+        assert!(!start_obs_websocket_server(0, false, "short"), "Short passwords must be rejected");
+        assert!(constant_time_eq(b"secret123", b"secret123"));
+        assert!(!constant_time_eq(b"secret123", b"secret124"));
+        assert!(!constant_time_eq(b"secret123", b"short"));
+
+        let (ok_lua, _) = dispatch_request("RunLuaScript", &json!({ "code": "return 1" }));
+        assert!(!ok_lua, "RunLuaScript must be blocked over remote API");
+
+        let (ok_so, _) = dispatch_request("LoadPluginSo", &json!({ "soPath": "/data/local/tmp/evil.so" }));
+        assert!(!ok_so, "LoadPluginSo must be blocked over remote API");
+
+        let (ok_trav, _) = dispatch_request("RemuxRecording", &json!({ "srcPath": "../etc/passwd", "dstPath": "/tmp/x.mp4" }));
+        assert!(!ok_trav, "Path traversal in RemuxRecording must be blocked");
     }
 }

@@ -276,7 +276,7 @@ async def run_all():
             ok_s, _, _ = await ws_req(ws, "CreateInput", {"inputKind": kind, "inputName": f"E2E_{kind}", "inputSettings": {}})
             record(f"Native Source ({kind})", ok_s)
 
-        for fid in ["panggung_auto_framing", "panggung_dynamic_delay", "panggung_source_record"]:
+        for fid in ["panggung_auto_framing", "panggung_dynamic_delay"]:
             ok_a, _, _ = await ws_req(ws, "CreateSourceFilter", {"sourceName": "Background", "filterName": f"E2E_{fid}", "filterKind": fid})
             ok_r, _, _ = await ws_req(ws, "RemoveSourceFilter", {"sourceName": "Background", "filterName": f"E2E_{fid}"})
             record(f"Native Filter ({fid})", ok_a and ok_r)

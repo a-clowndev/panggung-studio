@@ -113,7 +113,7 @@ static const char *EFFECT_3D_TILT =
     "}\n"
     "technique Draw { pass { vertex_shader = VSDefault(v_in); pixel_shader = PS3D(v_in); } }\n";
 
-static const char *EFFECT_ML_BG =
+static const char *EFFECT_LUMA_KEY =
     "uniform float4x4 ViewProj;\n"
     "uniform texture2d image;\n"
     "uniform float threshold;\n"
@@ -125,13 +125,52 @@ static const char *EFFECT_ML_BG =
     "    v_out.uv  = v_in.uv;\n"
     "    return v_out;\n"
     "}\n"
-    "float4 PSBgSeg(VertData v_in) : TARGET {\n"
+    "float4 PSLumaKey(VertData v_in) : TARGET {\n"
     "    float4 c = image.Sample(def_sampler, v_in.uv);\n"
     "    float luma = dot(c.rgb, float3(0.299, 0.587, 0.114));\n"
     "    float edge = smoothstep(threshold - 0.1, threshold + 0.1, luma);\n"
     "    return float4(c.rgb, c.a * edge);\n"
     "}\n"
-    "technique Draw { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSBgSeg(v_in); } }\n";
+    "technique Draw { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSLumaKey(v_in); } }\n";
+
+static const char *EFFECT_DIGITAL_PTZ =
+    "uniform float4x4 ViewProj;\n"
+    "uniform texture2d image;\n"
+    "uniform float zoom;\n"
+    "sampler_state def_sampler { Filter = Linear; AddressU = Clamp; AddressV = Clamp; };\n"
+    "struct VertData { float4 pos : POSITION; float2 uv : TEXCOORD0; };\n"
+    "VertData VSDefault(VertData v_in) {\n"
+    "    VertData v_out;\n"
+    "    v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);\n"
+    "    v_out.uv  = v_in.uv;\n"
+    "    return v_out;\n"
+    "}\n"
+    "float4 PSZoom(VertData v_in) : TARGET {\n"
+    "    float z = max(zoom, 1.0);\n"
+    "    float2 uv2 = (v_in.uv - float2(0.5, 0.5)) / z + float2(0.5, 0.5);\n"
+    "    return image.Sample(def_sampler, clamp(uv2, float2(0.0, 0.0), float2(1.0, 1.0)));\n"
+    "}\n"
+    "technique Draw { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSZoom(v_in); } }\n";
+
+static const char *EFFECT_VIGNETTE =
+    "uniform float4x4 ViewProj;\n"
+    "uniform texture2d image;\n"
+    "uniform float strength;\n"
+    "sampler_state def_sampler { Filter = Linear; AddressU = Clamp; AddressV = Clamp; };\n"
+    "struct VertData { float4 pos : POSITION; float2 uv : TEXCOORD0; };\n"
+    "VertData VSDefault(VertData v_in) {\n"
+    "    VertData v_out;\n"
+    "    v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);\n"
+    "    v_out.uv  = v_in.uv;\n"
+    "    return v_out;\n"
+    "}\n"
+    "float4 PSVignette(VertData v_in) : TARGET {\n"
+    "    float4 c = image.Sample(def_sampler, v_in.uv);\n"
+    "    float dist = length(v_in.uv - float2(0.5, 0.5));\n"
+    "    float vig = clamp(1.0 - dist * dist * strength * 1.5, 0.0, 1.0);\n"
+    "    return float4(c.rgb * vig, c.a);\n"
+    "}\n"
+    "technique Draw { pass { vertex_shader = VSDefault(v_in); pixel_shader = PSVignette(v_in); } }\n";
 
 static const char *EFFECT_GRADIENT =
     "uniform float4x4 ViewProj;\n"
@@ -236,10 +275,166 @@ DEFINE_SHADER_FILTER(blur,   "panggung_composite_blur",     "Composite Blur",   
 DEFINE_SHADER_FILTER(retro,  "panggung_retro_effects",      "Retro CRT / VHS Effects",     EFFECT_RETRO_CRT,      "intensity", 0.8f)
 DEFINE_SHADER_FILTER(glow,   "panggung_stroke_glow_shadow", "Stroke Glow Shadow",          EFFECT_STROKE_GLOW,    "strength",  1.5f)
 DEFINE_SHADER_FILTER(fx3d,   "panggung_3d_effect",          "3D Perspective Effect",       EFFECT_3D_TILT,        "tilt",      0.5f)
-DEFINE_SHADER_FILTER(mlbg,   "panggung_ml_background",      "Background Removal / Blur",   EFFECT_ML_BG,          "threshold", 0.2f)
-DEFINE_SHADER_FILTER(freeze, "panggung_freeze_filter",      "Freeze Frame Filter",         EFFECT_COMPOSITE_BLUR, "radius",    0.0f)
-DEFINE_SHADER_FILTER(movef,  "panggung_move_filter",        "Move Animation Filter",       EFFECT_3D_TILT,        "tilt",      0.0f)
-DEFINE_SHADER_FILTER(usrshd, "panggung_shaderfilter",       "User Custom Shader Filter",   EFFECT_RETRO_CRT,      "intensity", 0.5f)
+DEFINE_SHADER_FILTER(mlbg,   "panggung_ml_background",      "Luma Threshold Key",          EFFECT_LUMA_KEY,       "threshold", 0.2f)
+DEFINE_SHADER_FILTER(movef,  "panggung_move_filter",        "Digital Zoom / Framing",      EFFECT_DIGITAL_PTZ,    "zoom",      1.25f)
+DEFINE_SHADER_FILTER(usrshd, "panggung_shaderfilter",       "Vignette Shader Filter",      EFFECT_VIGNETTE,       "strength",  0.8f)
+
+/* ---------- Real GPU Freeze Frame Filter (gs_texrender_t capture) ---------- */
+struct freeze_ctx {
+    obs_source_t *context;
+    gs_texrender_t *texrender;
+    bool frozen;
+    bool captured;
+};
+static const char *freeze_name(void *u) { UNUSED_PARAMETER(u); return "Freeze Frame Filter"; }
+static void freeze_update(void *d, obs_data_t *s) {
+    struct freeze_ctx *f = d;
+    bool next = obs_data_get_bool(s, "freeze");
+    if (!next) f->captured = false;
+    f->frozen = next;
+}
+static void *freeze_create(obs_data_t *s, obs_source_t *src) {
+    struct freeze_ctx *f = bzalloc(sizeof(*f));
+    f->context = src;
+    obs_enter_graphics();
+    f->texrender = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+    obs_leave_graphics();
+    freeze_update(f, s);
+    return f;
+}
+static void freeze_destroy(void *d) {
+    struct freeze_ctx *f = d;
+    obs_enter_graphics();
+    if (f->texrender) gs_texrender_destroy(f->texrender);
+    obs_leave_graphics();
+    bfree(f);
+}
+static void freeze_render(void *d, gs_effect_t *efx) {
+    UNUSED_PARAMETER(efx);
+    struct freeze_ctx *f = d;
+    obs_source_t *target = obs_filter_get_target(f->context);
+    if (!target || !f->texrender) { obs_source_skip_video_filter(f->context); return; }
+    uint32_t cx = obs_source_get_base_width(target);
+    uint32_t cy = obs_source_get_base_height(target);
+    if (cx == 0 || cy == 0) { obs_source_skip_video_filter(f->context); return; }
+
+    if (!f->frozen || !f->captured) {
+        gs_texrender_reset(f->texrender);
+        if (gs_texrender_begin(f->texrender, cx, cy)) {
+            struct vec4 clear = { 0.0f, 0.0f, 0.0f, 0.0f };
+            gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
+            gs_ortho(0.0f, (float)cx, 0.0f, (float)cy, -100.0f, 100.0f);
+            obs_source_video_render(target);
+            gs_texrender_end(f->texrender);
+            f->captured = true;
+        }
+    }
+    gs_texture_t *tex = gs_texrender_get_texture(f->texrender);
+    if (!tex) { obs_source_skip_video_filter(f->context); return; }
+    gs_effect_t *def = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+    gs_effect_set_texture(gs_effect_get_param_by_name(def, "image"), tex);
+    while (gs_effect_loop(def, "Draw")) {
+        gs_draw_sprite(tex, 0, cx, cy);
+    }
+}
+static obs_properties_t *freeze_props(void *d) {
+    UNUSED_PARAMETER(d);
+    obs_properties_t *p = obs_properties_create();
+    obs_properties_add_bool(p, "freeze", "Freeze Current Frame");
+    return p;
+}
+static void freeze_defaults(obs_data_t *s) { obs_data_set_default_bool(s, "freeze", false); }
+static struct obs_source_info freeze_info = {
+    .id = "panggung_freeze_filter", .type = OBS_SOURCE_TYPE_FILTER, .output_flags = OBS_SOURCE_VIDEO,
+    .get_name = freeze_name, .create = freeze_create, .destroy = freeze_destroy,
+    .update = freeze_update, .get_properties = freeze_props, .get_defaults = freeze_defaults,
+    .video_render = freeze_render,
+};
+
+/* ---------- Real GPU Ring-Buffer Video Delay Filter (up to 15 frames) ---------- */
+#define DELAY_RING_MAX 16
+struct delay_ctx {
+    obs_source_t *context;
+    gs_texrender_t *ring[DELAY_RING_MAX];
+    int delay_frames;
+    int write_idx;
+    int filled;
+};
+static const char *dyndel_name(void *u) { UNUSED_PARAMETER(u); return "Video Frame Delay (GPU Ring)"; }
+static void dyndel_update(void *d, obs_data_t *s) {
+    struct delay_ctx *c = d;
+    int df = (int)obs_data_get_int(s, "delay_frames");
+    if (df < 0) df = 0;
+    if (df >= DELAY_RING_MAX) df = DELAY_RING_MAX - 1;
+    c->delay_frames = df;
+}
+static void *dyndel_create(obs_data_t *s, obs_source_t *src) {
+    struct delay_ctx *c = bzalloc(sizeof(*c));
+    c->context = src;
+    obs_enter_graphics();
+    for (int i = 0; i < DELAY_RING_MAX; i++) {
+        c->ring[i] = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+    }
+    obs_leave_graphics();
+    dyndel_update(c, s);
+    return c;
+}
+static void dyndel_destroy(void *d) {
+    struct delay_ctx *c = d;
+    obs_enter_graphics();
+    for (int i = 0; i < DELAY_RING_MAX; i++) {
+        if (c->ring[i]) gs_texrender_destroy(c->ring[i]);
+    }
+    obs_leave_graphics();
+    bfree(c);
+}
+static void dyndel_render(void *d, gs_effect_t *efx) {
+    UNUSED_PARAMETER(efx);
+    struct delay_ctx *c = d;
+    if (c->delay_frames <= 0) { obs_source_skip_video_filter(c->context); return; }
+    obs_source_t *target = obs_filter_get_target(c->context);
+    if (!target) { obs_source_skip_video_filter(c->context); return; }
+    uint32_t cx = obs_source_get_base_width(target);
+    uint32_t cy = obs_source_get_base_height(target);
+    if (cx == 0 || cy == 0) { obs_source_skip_video_filter(c->context); return; }
+
+    gs_texrender_t *wr = c->ring[c->write_idx];
+    if (wr) {
+        gs_texrender_reset(wr);
+        if (gs_texrender_begin(wr, cx, cy)) {
+            struct vec4 clear = { 0.0f, 0.0f, 0.0f, 0.0f };
+            gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
+            gs_ortho(0.0f, (float)cx, 0.0f, (float)cy, -100.0f, 100.0f);
+            obs_source_video_render(target);
+            gs_texrender_end(wr);
+        }
+    }
+    if (c->filled < DELAY_RING_MAX) c->filled++;
+    int offset = c->delay_frames < c->filled ? c->delay_frames : (c->filled - 1);
+    int read_idx = (c->write_idx - offset + DELAY_RING_MAX) % DELAY_RING_MAX;
+    c->write_idx = (c->write_idx + 1) % DELAY_RING_MAX;
+
+    gs_texture_t *tex = c->ring[read_idx] ? gs_texrender_get_texture(c->ring[read_idx]) : NULL;
+    if (!tex) { obs_source_skip_video_filter(c->context); return; }
+    gs_effect_t *def = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+    gs_effect_set_texture(gs_effect_get_param_by_name(def, "image"), tex);
+    while (gs_effect_loop(def, "Draw")) {
+        gs_draw_sprite(tex, 0, cx, cy);
+    }
+}
+static obs_properties_t *dyndel_props(void *d) {
+    UNUSED_PARAMETER(d);
+    obs_properties_t *p = obs_properties_create();
+    obs_properties_add_int_slider(p, "delay_frames", "Delay (Frames)", 0, DELAY_RING_MAX - 1, 1);
+    return p;
+}
+static void dyndel_defaults(obs_data_t *s) { obs_data_set_default_int(s, "delay_frames", 5); }
+static struct obs_source_info dyndel_info = {
+    .id = "panggung_dynamic_delay", .type = OBS_SOURCE_TYPE_FILTER, .output_flags = OBS_SOURCE_VIDEO,
+    .get_name = dyndel_name, .create = dyndel_create, .destroy = dyndel_destroy,
+    .update = dyndel_update, .get_properties = dyndel_props, .get_defaults = dyndel_defaults,
+    .video_render = dyndel_render,
+};
 
 /* ---------- Gradient Video Source (3P-11) ---------- */
 struct grad_src {
@@ -497,9 +692,7 @@ DEFINE_AUX_SOURCE(dirwtc,  "panggung_dir_watch_media",   "Directory Watch Media"
 DEFINE_AUX_SOURCE(rplsrc,  "panggung_replay_source",     "Instant Replay Source")
 DEFINE_AUX_SOURCE(dsksrc,  "panggung_downstream_keyer",  "Downstream Keyer")
 
-DEFINE_SHADER_FILTER(autofrm, "panggung_auto_framing",  "Auto-Framing Face Track", EFFECT_3D_TILT,         "tilt",   0.0f)
-DEFINE_SHADER_FILTER(dyndel,  "panggung_dynamic_delay", "Dynamic Video Delay",     EFFECT_COMPOSITE_BLUR,  "radius", 0.0f)
-DEFINE_SHADER_FILTER(srcrec,  "panggung_source_record", "Source Record Filter",    EFFECT_COMPOSITE_BLUR,  "radius", 0.0f)
+DEFINE_SHADER_FILTER(autofrm, "panggung_auto_framing",  "Digital PTZ / Framing", EFFECT_DIGITAL_PTZ, "zoom", 1.25f)
 
 bool obs_module_load(void) {
     obs_register_source(&blur_info);
@@ -524,7 +717,6 @@ bool obs_module_load(void) {
     obs_register_source(&dsksrc_info);
     obs_register_source(&autofrm_info);
     obs_register_source(&dyndel_info);
-    obs_register_source(&srcrec_info);
-    blog(LOG_INFO, "[panggung-3p-pack] Registered 23 native 3P & AndroidPlus filters/sources!");
+    blog(LOG_INFO, "[panggung-3p-pack] Registered 22 native 3P & AndroidPlus filters/sources!");
     return true;
 }

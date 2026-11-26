@@ -680,7 +680,11 @@ private fun TabletFullSidebarLayout(
                         Text("+ Add", color = PanggungColors.TealActive, fontSize = 10.sp, modifier = Modifier.clickable { callbacks.onCreateScene() })
                     },
                 ) {
-                    LazyColumn(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    LazyColumn(
+                        modifier = Modifier.weight(1f),
+                        contentPadding = PaddingValues(bottom = 4.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
                         items(snapshot.scenes.indices.toList()) { idx ->
                             val active = if (snapshot.studioMode) idx == snapshot.previewSceneIdx else idx == snapshot.activeSceneIdx
                             BroadcastButton(
@@ -704,7 +708,11 @@ private fun TabletFullSidebarLayout(
                         }
                     },
                 ) {
-                    LazyColumn(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    LazyColumn(
+                        modifier = Modifier.weight(1f),
+                        contentPadding = PaddingValues(bottom = 4.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
                         items(snapshot.sources) { src ->
                             val isSel = src.name == selectedSource
                             Row(
@@ -736,8 +744,8 @@ private fun TabletFullSidebarLayout(
                 }
             }
 
-            // Right Area: Giant Preview + Bottom 3 Docks
-            Column(modifier = Modifier.weight(1f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            // Right Area: Giant OBS-Style Preview + Sleek Source Bar + Compact Bottom 3 Docks
+            Column(modifier = Modifier.weight(1f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 InteractivePreviewCanvas(
                     obsReady = obsReady,
                     baseWidth = snapshot.baseWidth,
@@ -749,44 +757,60 @@ private fun TabletFullSidebarLayout(
                     studioMode = snapshot.studioMode,
                     transformVersion = transformVersion,
                     showZoomToolbar = true,
-                    modifier = Modifier.weight(0.56f).fillMaxWidth(),
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
                 )
                 if (selectedObj != null) {
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        BroadcastButton("Fit", { callbacks.onFitSource(selectedObj.name) }, compact = true, modifier = Modifier.weight(1f))
-                        BroadcastButton("↻ 90°", { callbacks.onRotateSource(selectedObj.name) }, compact = true, modifier = Modifier.weight(1f))
-                        BroadcastButton("⇄ Flip", { callbacks.onFlipSource(selectedObj.name) }, compact = true, modifier = Modifier.weight(1f))
-                        BroadcastButton("Prop", { callbacks.onOpenProperties(selectedObj.name) }, compact = true, modifier = Modifier.weight(1f))
-                        BroadcastButton("Flt", { callbacks.onOpenFilters(selectedObj.name) }, compact = true, modifier = Modifier.weight(1f))
-                        BroadcastButton("Xfrm", { callbacks.onOpenTransform(selectedObj.name) }, compact = true, modifier = Modifier.weight(1f))
+                    Row(
+                        modifier = Modifier.fillMaxWidth().height(32.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        BroadcastButton("Fit", { callbacks.onFitSource(selectedObj.name) }, compact = true, modifier = Modifier.weight(1f).fillMaxHeight())
+                        BroadcastButton("↻ 90°", { callbacks.onRotateSource(selectedObj.name) }, compact = true, modifier = Modifier.weight(1f).fillMaxHeight())
+                        BroadcastButton("⇄ Flip", { callbacks.onFlipSource(selectedObj.name) }, compact = true, modifier = Modifier.weight(1f).fillMaxHeight())
+                        BroadcastButton("Prop", { callbacks.onOpenProperties(selectedObj.name) }, compact = true, modifier = Modifier.weight(1f).fillMaxHeight())
+                        BroadcastButton("Flt", { callbacks.onOpenFilters(selectedObj.name) }, compact = true, modifier = Modifier.weight(1f).fillMaxHeight())
+                        BroadcastButton("Xfrm", { callbacks.onOpenTransform(selectedObj.name) }, compact = true, modifier = Modifier.weight(1f).fillMaxHeight())
                     }
                 }
-                Row(modifier = Modifier.weight(0.38f).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(modifier = Modifier.height(178.dp).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     // Dock 1: Vertical Stereo VU Mixer
                     DockPanel(
-                        title = "Audio Mixer (Vertical)",
+                        title = "Audio Mixer",
                         modifier = Modifier.weight(0.42f).fillMaxHeight(),
                         headerAction = {
                             Text("Full", color = PanggungColors.TealActive, fontSize = 10.sp, fontWeight = FontWeight.Bold, modifier = Modifier.clickable { callbacks.onOpenTabModal(1) })
                         },
                     ) {
                         val audioSources = snapshot.sources.filter { it.id.contains("audio") || it.id == "ffmpeg_source" }
-                        Row(modifier = Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                            audioSources.forEach { src ->
-                                Column(
-                                    modifier = Modifier.fillMaxHeight().width(58.dp),
-                                    horizontalAlignment = Alignment.CenterHorizontally,
-                                    verticalArrangement = Arrangement.spacedBy(3.dp),
-                                ) {
-                                    Text(src.name, color = PanggungColors.TextSecondary, fontSize = 9.sp, maxLines = 1)
-                                    StereoVuMeterBar(src.magnitudeDb, src.peakDb, src.muted, vertical = true, modifier = Modifier.weight(1f))
-                                    Text("ADV", color = PanggungColors.TealActive, fontSize = 8.5f.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.clickable { callbacks.onOpenAudioAdv(src.name) })
-                                    BroadcastButton(
-                                        if (src.muted) "MUTE" else "${(src.volume * 100).toInt()}%",
-                                        { callbacks.onToggleMute(src) },
-                                        tone = if (src.muted) BroadcastTone.Danger else BroadcastTone.Neutral,
-                                        compact = true,
-                                    )
+                        if (audioSources.isEmpty()) {
+                            Column(
+                                modifier = Modifier.fillMaxSize(),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.Center,
+                            ) {
+                                Text("No audio source in this scene", color = PanggungColors.TextMuted, fontSize = 10.sp)
+                                Spacer(Modifier.height(6.dp))
+                                BroadcastButton("+ Add Audio / Source", callbacks.onOpenAddSource, compact = true)
+                            }
+                        } else {
+                            Row(modifier = Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                audioSources.forEach { src ->
+                                    Column(
+                                        modifier = Modifier.fillMaxHeight().width(58.dp),
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                        verticalArrangement = Arrangement.spacedBy(3.dp),
+                                    ) {
+                                        Text(src.name, color = PanggungColors.TextSecondary, fontSize = 9.sp, maxLines = 1)
+                                        StereoVuMeterBar(src.magnitudeDb, src.peakDb, src.muted, vertical = true, modifier = Modifier.weight(1f))
+                                        Text("ADV", color = PanggungColors.TealActive, fontSize = 8.5f.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.clickable { callbacks.onOpenAudioAdv(src.name) })
+                                        BroadcastButton(
+                                            if (src.muted) "MUTE" else "${(src.volume * 100).toInt()}%",
+                                            { callbacks.onToggleMute(src) },
+                                            tone = if (src.muted) BroadcastTone.Danger else BroadcastTone.Neutral,
+                                            compact = true,
+                                        )
+                                    }
                                 }
                             }
                         }

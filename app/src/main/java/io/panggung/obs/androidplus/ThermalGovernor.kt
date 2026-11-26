@@ -74,7 +74,7 @@ object ThermalGovernor {
      */
     suspend fun checkLatestRelease(currentVersion: String): String = withContext(Dispatchers.IO) {
         try {
-            val conn = URL("https://api.github.com/repos/wigatha/obs-mobile/releases/latest")
+            val conn = URL("https://api.github.com/repos/a-clowndev/panggung-studio/releases/latest")
                 .openConnection() as HttpURLConnection
             conn.connectTimeout = 4000
             conn.readTimeout = 4000

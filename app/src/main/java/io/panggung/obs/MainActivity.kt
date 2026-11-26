@@ -130,7 +130,7 @@ class MainActivity : ComponentActivity() {
     private var obsVersion by mutableStateOf("...")
     private var snapshot by mutableStateOf(SnapshotUi())
     private var lastRecordPath by mutableStateOf("")
-    private var statusBanner by mutableStateOf("Remote API ready on :4455")
+    private var statusBanner by mutableStateOf("Ready (Remote OFF)")
     private var floatingHubEnabled by mutableStateOf(true)
 
     private lateinit var cameraCapture: Camera2Capture
@@ -692,7 +692,10 @@ class MainActivity : ComponentActivity() {
                 )
             }
             if (showRemoteQr) {
-                RemoteQrDialog(onDismiss = { showRemoteQr = false })
+                RemoteQrDialog(
+                    onDismiss = { showRemoteQr = false },
+                    onStatusChanged = { statusBanner = it },
+                )
             }
 
             if (filterTargetSource != null) {
@@ -907,7 +910,7 @@ class MainActivity : ComponentActivity() {
                             "panggung_retro_effects" to "Retro CRT",
                             "panggung_stroke_glow_shadow" to "Glow",
                             "panggung_3d_effect" to "3D Tilt",
-                            "panggung_ml_background" to "BG Remove",
+                            "panggung_ml_background" to "Luma Key",
                             "noise_suppress_filter_v2" to "RNNoise",
                             "panggung_dsp_pack" to "Reverb/DeEss",
                             "compressor_filter" to "Compressor",
@@ -1578,6 +1581,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onStop() {
         super.onStop()
+        if (obsReady) {
+            NativeBridge.nativeSaveSceneCollection(File(filesDir, "scene_collection.json").absolutePath)
+        }
         // Auto-show Floating Studio Hub popup when leaving into a game or another app
         if (obsReady && floatingHubEnabled && !isFinishing && Settings.canDrawOverlays(this)) {
             startService(Intent(this, FloatingBubbleService::class.java))

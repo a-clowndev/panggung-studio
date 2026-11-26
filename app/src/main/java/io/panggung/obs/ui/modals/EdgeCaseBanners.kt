@@ -6,8 +6,13 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -189,51 +194,91 @@ fun SourceContextMenuDialog(
 }
 
 @Composable
-fun RemoteQrDialog(onDismiss: () -> Unit) {
-    val localIp = getLocalIpv4Address()
-    val wsUrl = "ws://$localIp:4455"
-    val webUrl = "http://$localIp:8080"
+fun RemoteQrDialog(
+    onDismiss: () -> Unit,
+    onStatusChanged: (String) -> Unit = {},
+) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val initialStatus = remember {
+        try {
+            org.json.JSONObject(io.panggung.obs.NativeBridge.nativeGetRemoteStatusJson())
+        } catch (_: Exception) {
+            org.json.JSONObject()
+        }
+    }
+    var enabled by remember { mutableStateOf(initialStatus.optBoolean("enabled", false)) }
+    var lanAccess by remember { mutableStateOf(initialStatus.optBoolean("lanAccess", false)) }
+    var authToken by remember {
+        mutableStateOf(
+            initialStatus.optString("token", "").ifBlank { generateSecureRemoteToken() }
+        )
+    }
+
+    fun applyRemote(newEnabled: Boolean, newLan: Boolean, newToken: String) {
+        val ok = io.panggung.obs.NativeBridge.nativeSetRemoteControl(newEnabled, newLan, newToken)
+        if (ok || !newEnabled) {
+            enabled = newEnabled
+            lanAccess = newLan
+            authToken = newToken
+            onStatusChanged(
+                if (!newEnabled) "Ready (Remote OFF)"
+                else if (newLan) "Remote ON (LAN :4455 + Auth)"
+                else "Remote ON (127.0.0.1:4455)"
+            )
+        }
+    }
+
+    val host = if (lanAccess) getLocalIpv4Address() else "127.0.0.1"
+    val wsUrl = "ws://$host:4455"
+    val webUrl = "http://$host:8080/?token=$authToken"
+
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = PanggungColors.DockSurface,
-        title = { Text("Remote Control & QR Connect", color = PanggungColors.TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.Bold) },
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Remote Control (OBS WS v5)", color = PanggungColors.TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                Text(
+                    if (!enabled) "OFF" else if (lanAccess) "LAN + AUTH" else "LOCALHOST",
+                    color = if (!enabled) PanggungColors.TextMuted else if (lanAccess) PanggungColors.WarnBright else PanggungColors.LiveBright,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace,
+                )
+            }
+        },
         text = {
             Column(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                // Visual deterministic matrix code box for quick LAN pairing reference
-                Box(
-                    modifier = Modifier
-                        .size(148.dp)
-                        .clip(PanggungRadius.Card)
-                        .background(Color.White)
-                        .padding(10.dp),
+                Text(
+                    "Disabled by default for security. Requires SHA-256 auth; remote Lua scripting and native plugin loading are blocked.",
+                    color = PanggungColors.TextSecondary,
+                    fontSize = 11.sp,
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
-                    Canvas(modifier = Modifier.fillMaxSize()) {
-                        val n = 21
-                        val cell = size.width / n
-                        val seed = webUrl.hashCode()
-                        fun drawFinder(ox: Int, oy: Int) {
-                            for (r in 0..6) for (c in 0..6) {
-                                val edge = r == 0 || r == 6 || c == 0 || c == 6
-                                val inner = r in 2..4 && c in 2..4
-                                if (edge || inner) {
-                                    drawRect(Color.Black, Offset((ox + c) * cell, (oy + r) * cell), Size(cell, cell))
-                                }
-                            }
-                        }
-                        drawFinder(0, 0)
-                        drawFinder(n - 7, 0)
-                        drawFinder(0, n - 7)
-                        for (r in 0 until n) for (c in 0 until n) {
-                            val inFinder = (r < 8 && c < 8) || (r < 8 && c >= n - 8) || (r >= n - 8 && c < 8)
-                            if (!inFinder && ((seed xor (r * 31 + c * 17)) and 1) == 0) {
-                                drawRect(Color.Black, Offset(c * cell, r * cell), Size(cell, cell))
-                            }
-                        }
-                    }
+                    Text("Enable Remote Server (4455 / 8080)", color = PanggungColors.TextPrimary, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                    Switch(
+                        checked = enabled,
+                        onCheckedChange = { applyRemote(it, lanAccess, authToken) },
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text("Allow LAN Access (0.0.0.0)", color = PanggungColors.TextPrimary, fontSize = 12.sp)
+                    Switch(
+                        checked = lanAccess,
+                        enabled = enabled,
+                        onCheckedChange = { applyRemote(enabled, it, authToken) },
+                    )
                 }
                 Column(
                     modifier = Modifier
@@ -244,16 +289,36 @@ fun RemoteQrDialog(onDismiss: () -> Unit) {
                         .padding(10.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
-                    Text("WebSocket Remote API v5 (Companion / Stream Deck)", color = PanggungColors.TextMuted, fontSize = 10.sp)
-                    Text(wsUrl, color = PanggungColors.LiveBright, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
-                    Spacer(Modifier.height(4.dp))
-                    Text("Built-in Web Remote UI (Any Browser)", color = PanggungColors.TextMuted, fontSize = 10.sp)
-                    Text(webUrl, color = PanggungColors.TealActive, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                    Text("Session Password / Token (SHA-256)", color = PanggungColors.TextMuted, fontSize = 10.sp)
+                    Text(authToken, color = PanggungColors.WarnBright, fontSize = 13.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        BroadcastButton("Copy Token", onClick = {
+                            val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                            cm.setPrimaryClip(android.content.ClipData.newPlainText("Panggung Token", authToken))
+                        }, compact = true, modifier = Modifier.weight(1f))
+                        BroadcastButton("Rotate", onClick = {
+                            val fresh = generateSecureRemoteToken()
+                            applyRemote(enabled, lanAccess, fresh)
+                        }, compact = true, modifier = Modifier.weight(1f))
+                    }
+                    if (enabled) {
+                        Spacer(Modifier.height(4.dp))
+                        Text("WebSocket API v5 (Companion / Stream Deck)", color = PanggungColors.TextMuted, fontSize = 10.sp)
+                        Text(wsUrl, color = PanggungColors.LiveBright, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                        Text("Web Remote UI (with token)", color = PanggungColors.TextMuted, fontSize = 10.sp)
+                        Text("http://$host:8080", color = PanggungColors.TealActive, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                    }
                 }
             }
         },
         confirmButton = { BroadcastButton("Done", onClick = onDismiss, tone = BroadcastTone.Primary) },
     )
+}
+
+private fun generateSecureRemoteToken(): String {
+    val chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+    val rng = java.security.SecureRandom()
+    return (1..16).map { chars[rng.nextInt(chars.length)] }.joinToString("")
 }
 
 fun getLocalIpv4Address(): String {

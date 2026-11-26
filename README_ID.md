@@ -59,7 +59,7 @@ Aplikasi ini menghadirkan komposisi multi-scene penuh, perekaman **Hybrid MP4** 
 | Kemampuan | Detail |
 | --- | --- |
 | **MediaCodec Hardware Encoding** | Mendukung H.264, HEVC (termasuk Main10 10-bit HDR), AV1, dan VP9 dengan Session Generation ID, fallback aman per-percobaan, serta pengaturan bitrate live (`obs_encoder_update`) tanpa memutus stream. |
-| **Zero-Copy GLES 3.2 Compositor** | Backend kustom `libobs-gles` dengan `AHardwareBuffer` → `EGLImageKHR` + `EGLSyncKHR` + `samplerExternalOES` (`Zero-Copy AHardwareBuffer=YES`). |
+| **Compositor GLES 3.2** | Backend kustom `libobs-gles` dengan dukungan `AHardwareBuffer` → `EGLImageKHR` + `EGLSyncKHR` + `samplerExternalOES` (pipeline Camera2 & WebView saat ini memakai buffer upload I420/RGBA). |
 | **Pipeline 10-bit HDR** | Komposisi Rec. 2100 PQ & HLG menggunakan `P010` / `GL_R16F` / `GL_RG16F` / `GL_RGBA16F` serta encoder hardware `android_mediacodec_hevc_hdr` (`primaries=bt2020`, `trc=smpte2084`). |
 | **Encoder Software Terintegrasi** | Dilengkapi `x264`, `x265 3.6`, dan `libaom 3.10.0` (AV1) melalui **FFmpeg 8.1.3** (`libsrt v1.5.4`, `libxml2 v2.13.5`/DASH, `mbedTLS`). |
 | **Canvas Landscape & Portrait 9:16** | Mendukung penuh **Landscape 16:9** (`1280×720` / `1920×1080`) dan **Portrait Vertikal 9:16** (`720×1280` / `1080×1920`) khusus TikTok Live, YouTube Shorts, dan Instagram Live. |
@@ -73,7 +73,7 @@ Aplikasi ini menghadirkan komposisi multi-scene penuh, perekaman **Hybrid MP4** 
 | **Floating Studio Hub In-Game** | Muncul otomatis saat keluar studio / masuk game (pil **`● LIVE`** / **`● HUB`** yang bisa digeser). Tap untuk membuka tombol cepat **`REC`**, **`MIC`**, **`CAM`**, **`LAYOUT`**, **`SCENE`**, dan **`STUDIO`**. |
 | **Kontrol Kamera PiP Langsung di Game** | Tap **`CAM`** di Floating Hub untuk geser posisi kamera (drag), ubah ukuran lewat sudut **`◢`** atau preset **`S`/`M`/`L`**, ganti **`FRONT`/`BACK`**, putar **`↻ 90°`**, balik **`⇄ H`** / **`⇅ V`**, lalu kunci dengan **`✓ DONE`** (rasio asli tetap utuh 100%). |
 | **Preset Layout 1-Tap (Cocok TikTok Gaming)** | Tap **`LAYOUT`** di Floating Hub untuk berpindah cepat antar **`SPLIT 2`** (Atas Kamera + Tengah Game Fit Full-Width + Bawah Ruang Chat/Gift TikTok), **`3-SLOT`** (Kamera + Game + Slot Overlay Bawah), **`GAME+PiP`**, dan **`FULL CAM`**. |
-| **Browser, USB UVC, NDI® & Media** | WebView Browser Source (`window.obsstudio`), kamera USB UVC (`UsbUvcCapture`), NDI® LAN BYOR (`NdiManager`), teks FreeType2, pemutar gambar/media, serta peredam bising **SpeexDSP 1.2.1** + Stereo VU Meter (`obs_volmeter_t`). |
+| **Browser, Media & I/O Eksperimental** | WebView Browser Source (`window.obsstudio`), teks FreeType2, pemutar gambar/media, peredam bising **SpeexDSP 1.2.1** + Stereo VU Meter (`obs_volmeter_t`), paket filter GPU (`Composite Blur`, `Retro CRT`, `Stroke Glow`, `3D Perspective`, `Luma Threshold Key`, `Digital PTZ`, `Freeze Frame`, `GPU Ring Frame Delay`), serta fondasi eksperimental USB UVC / NDI® (BYOR). |
 
 ### UI Adaptif, Remote Control & Perlindungan Thermal
 
@@ -81,7 +81,7 @@ Aplikasi ini menghadirkan komposisi multi-scene penuh, perekaman **Hybrid MP4** 
 | --- | --- |
 | **Layout Responsif 3-Mode** | Otomatis menyesuaikan tampilan **HP Portrait**, **Landscape 3-Kolom Ringkas**, dan **Tablet / Samsung DeX Full-Sidebar**, lengkap dengan kunci orientasi **`AUTO` / `PORT` / `LAND`**. |
 | **Preview Sentuh Interaktif** | Drag posisi, pinch-to-zoom, dan rotasi poros tengah dengan magnet snap **`0°/90°/180°/270°`**, crosshair tengah, serta tombol `Fit`, `Center`, `Flip`, dan `Reset`. |
-| **Remote API & Scripting** | Server `obs-websocket v5` bawaan di port `:4455` (dengan QR pairing), engine **Lua 5.4**, Studio Mode T-Bar + Fade-to-Black, dan Replay Buffer Hybrid MP4. |
+| **Remote API Aman & Persistensi Penuh** | Server `obs-websocket v5` (`:4455`) & Web Remote (`:8080`) **nonaktif secara default**, hanya `localhost` kecuali LAN diaktifkan eksplisit, wajib **autentikasi SHA-256 challenge-response + token**, eksekusi Lua/plugin lewat remote diblokir. Persistensi koleksi scene v2 penuh (scene, source, transform, visibility, lock, audio, filter) otomatis tersimpan. |
 | **Thermal Governor & Crash Recovery** | Pemantauan suhu/headroom tiap 5 detik dengan penyesuaian bitrate otomatis saat panas, Keep-Screen-On, penyimpanan SAF (`SafFdBridge`), serta banner pemulihan crash. |
 
 ## Persyaratan
@@ -119,7 +119,7 @@ Aplikasi ini menghadirkan komposisi multi-scene penuh, perekaman **Hybrid MP4** 
 ## Struktur Proyek
 
 ```text
-obs-mobile/
+panggung-studio/
 ├── app/                    # Aplikasi Android (UI Jetpack Compose, Capture, Service, JNI)
 ├── crates/panggung-core/   # Core Rust native (libobs FFI, JNI, obs-websocket v5, Lua 5.4)
 ├── native/

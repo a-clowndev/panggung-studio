@@ -59,7 +59,7 @@ It brings full scene compositing, multi-source capture, **TikTok Vertical 9:16 (
 | Capability | Details |
 | --- | --- |
 | **MediaCodec Hardware Encoding** | H.264, HEVC (including Main10 10-bit HDR), AV1, and VP9 with Session Generation IDs, safe recreate-per-attempt fallback, and live bitrate adjustment (`obs_encoder_update`) without dropping active streams. |
-| **Zero-Copy GLES 3.2 Compositor** | Custom `libobs-gles` backend supporting `AHardwareBuffer` → `EGLImageKHR` + `EGLSyncKHR` + `samplerExternalOES` zero-copy texture import (`Zero-Copy AHardwareBuffer=YES`). |
+| **GLES 3.2 Compositor** | Custom `libobs-gles` backend with `AHardwareBuffer` → `EGLImageKHR` + `EGLSyncKHR` + `samplerExternalOES` support (Camera2 and WebView currently upload via I420/RGBA buffers). |
 | **10-bit HDR Pipeline** | Rec. 2100 PQ & HLG compositing with `P010` / `GL_R16F` / `GL_RG16F` / `GL_RGBA16F` render targets and `android_mediacodec_hevc_hdr` hardware encoding (`primaries=bt2020`, `trc=smpte2084`). |
 | **Bundled Software Encoders** | Cross-compiled `x264`, `x265 3.6`, and `libaom 3.10.0` (AV1) via **FFmpeg 8.1.3** (`libsrt v1.5.4`, `libxml2 v2.13.5`/DASH, `mbedTLS`). |
 | **Dual Orientation Canvas** | Instant switching between **16:9 Landscape** (`1280×720` / `1920×1080`) and **9:16 Vertical Portrait** (`720×1280` / `1080×1920`) for TikTok Live, YouTube Shorts, and Instagram Live. |
@@ -73,7 +73,7 @@ It brings full scene compositing, multi-source capture, **TikTok Vertical 9:16 (
 | **In-Game Floating Studio Hub** | Auto-appears when entering a game (`● LIVE` / `● HUB` draggable pill). Expands to 1-tap **`REC`**, **`MIC`**, **`CAM`**, **`LAYOUT`**, **`SCENE`**, and **`STUDIO`**. |
 | **In-Game Camera PiP Controls** | Tap **`CAM`** in-game to drag camera position, resize via corner handle (`◢`) or `S`/`M`/`L` presets, flip **`FRONT`/`BACK`**, rotate **`↻ 90°`**, mirror **`⇄ H`** / **`⇅ V`**, and lock with **`✓ DONE`** — all while preserving 100% true aspect ratio. |
 | **1-Tap In-Game Layout Presets** | Tap **`LAYOUT`** in the Floating Hub to switch live between **`SPLIT 2`** (Top Camera + Full-Width Fit Game + Bottom TikTok Chat Safe Zone), **`3-SLOT`** (Camera + Game + Bottom Overlay/Chat), **`GAME+PiP`**, and **`FULL CAM`**. |
-| **Browser, USB UVC, NDI® & Media** | WebView Browser Source (`window.obsstudio`), USB UVC capture (`UsbUvcCapture`), NDI® LAN BYOR (`NdiManager`), FreeType2 text, Image/Media playback, and **SpeexDSP 1.2.1** noise suppression + Stereo VU meters (`obs_volmeter_t`). |
+| **Browser, Media & Experimental I/O** | WebView Browser Source (`window.obsstudio`), FreeType2 text, Image/Media playback, **SpeexDSP 1.2.1** noise suppression + Stereo VU meters (`obs_volmeter_t`), GPU shader pack (`Composite Blur`, `Retro CRT`, `Stroke Glow`, `3D Perspective`, `Luma Threshold Key`, `Digital PTZ`, `Freeze Frame`, `GPU Ring Frame Delay`), plus experimental USB UVC / NDI® (BYOR) scaffolding. |
 
 ### Adaptive UI, Remote Control & Thermal Safety
 
@@ -81,7 +81,7 @@ It brings full scene compositing, multi-source capture, **TikTok Vertical 9:16 (
 | --- | --- |
 | **3-Tier Responsive Workspace** | Seamlessly adapts between **Phone Portrait**, **Compact 3-Column Landscape**, and **Tablet / Samsung DeX Full-Sidebar**, with persistent Orientation Lock (`AUTO` / `PORT` / `LAND`). |
 | **Interactive Touch Preview** | Direct canvas drag, pinch-to-zoom, and center-pivot rotation with magnetic `0°/90°/180°/270°` snapping, alignment crosshair, and `Fit` / `Center` / `Flip` / `Reset` controls. |
-| **Remote API & Scripting** | Built-in `obs-websocket v5` server on port `:4455` (with QR pairing), **Lua 5.4** scripting engine, Studio Mode T-Bar + Fade-to-Black, and Hybrid MP4 Replay Buffer. |
+| **Hardened Remote API & Persistence** | Opt-in `obs-websocket v5` (`:4455`) & Web Remote (`:8080`) — **disabled by default**, localhost-only unless LAN is explicitly enabled, mandatory **SHA-256 challenge-response + token auth**, remote Lua/plugin loading blocked. Full v2 scene collection persistence (scenes, sources, transforms, visibility, lock, audio, filters) auto-saved across restarts. |
 | **Thermal Governor & Crash Recovery** | 5-second `PowerManager.getThermalHeadroom` monitoring with automatic live bitrate throttling, Keep-Screen-On, SAF shared-storage recording (`SafFdBridge`), and persistent crash recovery log. |
 
 ## Requirements
@@ -119,7 +119,7 @@ It brings full scene compositing, multi-source capture, **TikTok Vertical 9:16 (
 ## Project Structure
 
 ```text
-obs-mobile/
+panggung-studio/
 ├── app/                    # Android app (Jetpack Compose UI, Capture, Services, JNI bridge)
 ├── crates/panggung-core/   # Rust native core (libobs FFI, JNI bindings, obs-websocket v5, Lua 5.4)
 ├── native/

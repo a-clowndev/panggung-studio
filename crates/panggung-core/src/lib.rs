@@ -162,6 +162,10 @@ unsafe extern "C" fn preview_draw_cb(_param: *mut libc::c_void, cx: u32, cy: u32
     }
 }
 
+/// Adds a source to `scene`, reusing an existing global OBS source if one with the same
+/// name and `id` already exists (OBS Desktop "Add Existing" semantics). Always returns the
+/// exact actual OBS source name (`obs_source_get_name`) so `sc.sources` never desyncs when
+/// libobs auto-suffixes duplicate names (e.g. "Color Source 2").
 fn add_source_to_scene(
     scene: *mut sys::obs_scene_t,
     id: &str,
@@ -169,26 +173,61 @@ fn add_source_to_scene(
     settings_json: Option<&str>,
     base_w: u32,
     base_h: u32,
-) -> bool {
-    let Ok(c_id) = CString::new(id) else { return false; };
-    let Ok(c_name) = CString::new(name) else { return false; };
+) -> Option<String> {
+    let Ok(c_id) = CString::new(id) else { return None; };
+    let Ok(c_name) = CString::new(name) else { return None; };
     unsafe {
-        let settings = match settings_json {
-            Some(j) if !j.is_empty() => {
-                if let Ok(cj) = CString::new(j) {
-                    sys::obs_data_create_from_json(cj.as_ptr())
-                } else {
-                    sys::obs_data_create()
-                }
+        // 1. Check if this scene already contains a source with this name
+        let existing_item = sys::obs_scene_find_source(scene, c_name.as_ptr());
+        if !existing_item.is_null() {
+            return Some(name.to_string());
+        }
+
+        // 2. Reuse existing global OBS source if name + id match (critical for shared Camera / Screen / Mic across scenes)
+        let mut reused = false;
+        let existing_global = sys::obs_get_source_by_name(c_name.as_ptr());
+        let src = if !existing_global.is_null() {
+            let ex_id_ptr = sys::obs_source_get_id(existing_global);
+            let ex_id = if ex_id_ptr.is_null() { "" } else { CStr::from_ptr(ex_id_ptr).to_str().unwrap_or("") };
+            if ex_id == id {
+                reused = true;
+                existing_global
+            } else {
+                sys::obs_source_release(existing_global);
+                ptr::null_mut()
             }
-            _ => sys::obs_data_create(),
+        } else {
+            ptr::null_mut()
         };
-        let src = sys::obs_source_create(c_id.as_ptr(), c_name.as_ptr(), settings, ptr::null_mut());
-        sys::obs_data_release(settings);
+
+        let src = if !src.is_null() {
+            src
+        } else {
+            let settings = match settings_json {
+                Some(j) if !j.is_empty() => {
+                    if let Ok(cj) = CString::new(j) {
+                        sys::obs_data_create_from_json(cj.as_ptr())
+                    } else {
+                        sys::obs_data_create()
+                    }
+                }
+                _ => sys::obs_data_create(),
+            };
+            let created = sys::obs_source_create(c_id.as_ptr(), c_name.as_ptr(), settings, ptr::null_mut());
+            sys::obs_data_release(settings);
+            created
+        };
+
         if src.is_null() {
             error!("obs_source_create failed for id={id}, name={name}");
-            return false;
+            return None;
         }
+
+        let actual_name = {
+            let np = sys::obs_source_get_name(src);
+            if np.is_null() { name.to_string() } else { CStr::from_ptr(np).to_string_lossy().into_owned() }
+        };
+
         let item = sys::obs_scene_add(scene, src);
         if !item.is_null() && !id.contains("audio") {
             let center = sys::vec2 { x: base_w as f32 * 0.5, y: base_h as f32 * 0.5 };
@@ -199,11 +238,11 @@ fn add_source_to_scene(
             sys::obs_sceneitem_set_bounds_type(item, OBS_BOUNDS_SCALE_INNER);
             sys::obs_sceneitem_set_bounds(item, &bounds);
         }
-        if id.contains("audio") || id == "ffmpeg_source" || id == "android_webview" {
-            attach_volmeter_to_source(src, name);
+        if !reused && (id.contains("audio") || id == "ffmpeg_source" || id == "android_webview") {
+            attach_volmeter_to_source(src, &actual_name);
         }
         sys::obs_source_release(src);
-        !item.is_null()
+        if item.is_null() { None } else { Some(actual_name) }
     }
 }
 
@@ -286,11 +325,11 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeInit(
 
             let mut sources = Vec::new();
             let bg_json = format!(r#"{{"color":4293616421,"width":{bw},"height":{bh}}}"#);
-            if add_source_to_scene(scene, "color_source", "Background", Some(&bg_json), bw, bh) {
-                sources.push("Background".to_string());
+            if let Some(n) = add_source_to_scene(scene, "color_source", "Background", Some(&bg_json), bw, bh) {
+                sources.push(n);
             }
-            if add_source_to_scene(scene, "android_audio_input", "Microphone", None, bw, bh) {
-                sources.push("Microphone".to_string());
+            if let Some(n) = add_source_to_scene(scene, "android_audio_input", "Microphone", None, bw, bh) {
+                sources.push(n);
             }
 
             *STATE.lock().unwrap() = Some(AppState {
@@ -320,8 +359,8 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeInit(
                 vertical_view: ptr::null_mut(),
                 last_crash_report,
             });
-            ws_server::spawn_obs_websocket_server(4455);
-            web_remote::spawn_web_remote_server(8080);
+            // SECURITY: Remote WebSocket (4455) & Web Remote (8080) are disabled by default.
+            // Users explicitly opt in via Remote Control dialog with mandatory SHA-256 auth.
             JNI_TRUE
         }
         Err(e) => {
@@ -542,9 +581,10 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeAddSource(
     let bh = state.base_height;
     let idx = if state.studio_mode { state.preview_scene_idx } else { state.active_scene_idx };
     let sc = &mut state.scenes[idx];
-    let ok = add_source_to_scene(sc.scene, &id, &name, if json.is_empty() { None } else { Some(&json) }, bw, bh);
-    if ok {
-        sc.sources.push(name);
+    if let Some(actual_name) = add_source_to_scene(sc.scene, &id, &name, if json.is_empty() { None } else { Some(&json) }, bw, bh) {
+        if !sc.sources.contains(&actual_name) {
+            sc.sources.push(actual_name);
+        }
         JNI_TRUE
     } else {
         JNI_FALSE
@@ -738,8 +778,142 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeSaveSceneCollecti
     mut env: JNIEnv, _class: JClass, path: JString,
 ) -> jboolean {
     let Ok(path): Result<String, _> = env.get_string(&path).map(|s| s.into()) else { return JNI_FALSE; };
-    let snap = ws_get_snapshot();
-    match serde_json::to_string_pretty(&snap) {
+    let guard = STATE.lock().unwrap();
+    let Some(state) = guard.as_ref() else { return JNI_FALSE; };
+
+    let mut scenes_json = Vec::with_capacity(state.scenes.len());
+    for sc in &state.scenes {
+        let mut items_json = Vec::new();
+        for sname in &sc.sources {
+            let Ok(c_name) = CString::new(sname.as_str()) else { continue; };
+            unsafe {
+                let item = sys::obs_scene_find_source(sc.scene, c_name.as_ptr());
+                if item.is_null() { continue; }
+                let src = sys::obs_sceneitem_get_source(item);
+                if src.is_null() { continue; }
+
+                let id_ptr = sys::obs_source_get_id(src);
+                let id_str = if id_ptr.is_null() { String::new() } else { CStr::from_ptr(id_ptr).to_string_lossy().into_owned() };
+
+                let settings_data = sys::obs_source_get_settings(src);
+                let settings_val: serde_json::Value = if !settings_data.is_null() {
+                    let jp = sys::obs_data_get_json(settings_data);
+                    let v = if !jp.is_null() {
+                        serde_json::from_str(&CStr::from_ptr(jp).to_string_lossy()).unwrap_or(serde_json::json!({}))
+                    } else {
+                        serde_json::json!({})
+                    };
+                    sys::obs_data_release(settings_data);
+                    v
+                } else {
+                    serde_json::json!({})
+                };
+
+                let mut pos = sys::vec2 { x: 0.0, y: 0.0 };
+                let mut scale = sys::vec2 { x: 1.0, y: 1.0 };
+                let mut bounds = sys::vec2 { x: 0.0, y: 0.0 };
+                sys::obs_sceneitem_get_pos(item, &mut pos);
+                sys::obs_sceneitem_get_scale(item, &mut scale);
+                sys::obs_sceneitem_get_bounds(item, &mut bounds);
+                let rot = sys::obs_sceneitem_get_rot(item);
+                let bounds_type = sys::obs_sceneitem_get_bounds_type(item);
+                let alignment = sys::obs_sceneitem_get_alignment(item);
+                let bounds_alignment = sys::obs_sceneitem_get_bounds_alignment(item);
+                let visible = sys::obs_sceneitem_visible(item);
+                let locked = sys::obs_sceneitem_locked(item);
+
+                let volume = sys::obs_source_get_volume(src);
+                let muted = sys::obs_source_muted(src);
+                let sync_offset = sys::obs_source_get_sync_offset(src);
+                let balance = sys::obs_source_get_balance_value(src);
+                let audio_mixers = sys::obs_source_get_audio_mixers(src);
+                let monitoring_type = sys::obs_source_get_monitoring_type(src);
+
+                // Enumerate attached filters + their settings
+                let flt_raw = ws_list_filters_json(sname);
+                let flt_arr: Vec<serde_json::Value> = serde_json::from_str(&flt_raw).unwrap_or_default();
+                let mut filters_out = Vec::new();
+                for f in flt_arr {
+                    let fname = f.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                    let fid = f.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                    let fenabled = f.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
+                    let fsettings = if let Ok(cfn) = CString::new(fname) {
+                        let fptr = sys::obs_source_get_filter_by_name(src, cfn.as_ptr());
+                        if !fptr.is_null() {
+                            let fd = sys::obs_source_get_settings(fptr);
+                            let fv = if !fd.is_null() {
+                                let jp = sys::obs_data_get_json(fd);
+                                let parsed = if !jp.is_null() {
+                                    serde_json::from_str(&CStr::from_ptr(jp).to_string_lossy()).unwrap_or(serde_json::json!({}))
+                                } else {
+                                    serde_json::json!({})
+                                };
+                                sys::obs_data_release(fd);
+                                parsed
+                            } else {
+                                serde_json::json!({})
+                            };
+                            sys::obs_source_release(fptr);
+                            fv
+                        } else {
+                            serde_json::json!({})
+                        }
+                    } else {
+                        serde_json::json!({})
+                    };
+                    filters_out.push(serde_json::json!({
+                        "id": fid,
+                        "name": fname,
+                        "enabled": fenabled,
+                        "settings": fsettings
+                    }));
+                }
+
+                items_json.push(serde_json::json!({
+                    "name": sname,
+                    "id": id_str,
+                    "settings": settings_val,
+                    "visible": visible,
+                    "locked": locked,
+                    "pos_x": pos.x,
+                    "pos_y": pos.y,
+                    "scale_x": scale.x,
+                    "scale_y": scale.y,
+                    "rot": rot,
+                    "bounds_type": bounds_type,
+                    "bounds_x": bounds.x,
+                    "bounds_y": bounds.y,
+                    "alignment": alignment,
+                    "bounds_alignment": bounds_alignment,
+                    "volume": volume,
+                    "muted": muted,
+                    "sync_offset_ns": sync_offset,
+                    "balance": balance,
+                    "audio_mixers": audio_mixers,
+                    "monitoring_type": monitoring_type,
+                    "filters": filters_out
+                }));
+            }
+        }
+        scenes_json.push(serde_json::json!({
+            "name": sc.name,
+            "items": items_json
+        }));
+    }
+
+    let doc = serde_json::json!({
+        "version": 2,
+        "active_scene_idx": state.active_scene_idx,
+        "base_width": state.base_width,
+        "base_height": state.base_height,
+        "fps": state.fps,
+        "transition_id": state.transition_id,
+        "transition_ms": state.transition_ms,
+        "video_encoder_id": state.video_encoder_id,
+        "scenes": scenes_json
+    });
+
+    match serde_json::to_string_pretty(&doc) {
         Ok(s) => if std::fs::write(&path, s).is_ok() { JNI_TRUE } else { JNI_FALSE },
         Err(_) => JNI_FALSE,
     }
@@ -1239,17 +1413,151 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeLoadSceneCollecti
     let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else { return JNI_FALSE; };
     let mut guard = STATE.lock().unwrap();
     let Some(state) = guard.as_mut() else { return JNI_FALSE; };
+
+    let bw = state.base_width;
+    let bh = state.base_height;
+
     if let Some(arr) = val.get("scenes").and_then(|s| s.as_array()) {
         for sc in arr {
-            if let Some(sname) = sc.as_str() {
-                if !state.scenes.iter().any(|e| e.name == sname) {
-                    if let Ok(c) = CString::new(sname) {
-                        let ptr = unsafe { sys::obs_scene_create(c.as_ptr()) };
-                        if !ptr.is_null() {
-                            state.scenes.push(SceneEntry { name: sname.to_string(), scene: ptr, sources: vec![] });
+            // Support both v2 full object format and legacy v1 string format
+            let sname = sc.as_str()
+                .or_else(|| sc.get("name").and_then(|n| n.as_str()))
+                .unwrap_or("");
+            if sname.is_empty() { continue; }
+
+            let sc_idx = if let Some(existing) = state.scenes.iter().position(|e| e.name == sname) {
+                existing
+            } else {
+                let Ok(c) = CString::new(sname) else { continue; };
+                let ptr = unsafe { sys::obs_scene_create(c.as_ptr()) };
+                if ptr.is_null() { continue; }
+                state.scenes.push(SceneEntry { name: sname.to_string(), scene: ptr, sources: vec![] });
+                state.scenes.len() - 1
+            };
+
+            let scene_ptr = state.scenes[sc_idx].scene;
+            if let Some(items) = sc.get("items").and_then(|x| x.as_array()) {
+                for it in items {
+                    let item_name = it.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                    let item_id = it.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                    if item_name.is_empty() || item_id.is_empty() { continue; }
+                    let settings_str = it.get("settings").map(|v| v.to_string()).unwrap_or_else(|| "{}".into());
+
+                    // Create or reuse source in scene if not already present
+                    if !state.scenes[sc_idx].sources.iter().any(|s| s == item_name) {
+                        if let Some(actual_name) = add_source_to_scene(scene_ptr, item_id, item_name, Some(&settings_str), bw, bh) {
+                            if !state.scenes[sc_idx].sources.contains(&actual_name) {
+                                state.scenes[sc_idx].sources.push(actual_name);
+                            }
+                        }
+                    }
+
+                    // Restore full transform, visibility, lock, audio, and filters
+                    let Ok(c_item_name) = CString::new(item_name) else { continue; };
+                    unsafe {
+                        let item = sys::obs_scene_find_source(scene_ptr, c_item_name.as_ptr());
+                        if item.is_null() { continue; }
+
+                        if let Some(a) = it.get("alignment").and_then(|x| x.as_u64()) {
+                            sys::obs_sceneitem_set_alignment(item, a as u32);
+                        }
+                        if let Some(ba) = it.get("bounds_alignment").and_then(|x| x.as_u64()) {
+                            sys::obs_sceneitem_set_bounds_alignment(item, ba as u32);
+                        }
+                        if let Some(bt) = it.get("bounds_type").and_then(|x| x.as_i64()) {
+                            sys::obs_sceneitem_set_bounds_type(item, bt as i32);
+                        }
+                        if let (Some(bx), Some(by)) = (
+                            it.get("bounds_x").and_then(|x| x.as_f64()),
+                            it.get("bounds_y").and_then(|x| x.as_f64()),
+                        ) {
+                            let b = sys::vec2 { x: bx as f32, y: by as f32 };
+                            sys::obs_sceneitem_set_bounds(item, &b);
+                        }
+                        if let (Some(px), Some(py)) = (
+                            it.get("pos_x").and_then(|x| x.as_f64()),
+                            it.get("pos_y").and_then(|x| x.as_f64()),
+                        ) {
+                            let p = sys::vec2 { x: px as f32, y: py as f32 };
+                            sys::obs_sceneitem_set_pos(item, &p);
+                        }
+                        if let (Some(sx), Some(sy)) = (
+                            it.get("scale_x").and_then(|x| x.as_f64()),
+                            it.get("scale_y").and_then(|x| x.as_f64()),
+                        ) {
+                            let scv = sys::vec2 { x: sx as f32, y: sy as f32 };
+                            sys::obs_sceneitem_set_scale(item, &scv);
+                        }
+                        if let Some(rot) = it.get("rot").and_then(|x| x.as_f64()) {
+                            sys::obs_sceneitem_set_rot(item, rot as f32);
+                        }
+                        if let Some(vis) = it.get("visible").and_then(|x| x.as_bool()) {
+                            sys::obs_sceneitem_set_visible(item, vis);
+                        }
+                        if let Some(lck) = it.get("locked").and_then(|x| x.as_bool()) {
+                            sys::obs_sceneitem_set_locked(item, lck);
+                        }
+
+                        let src = sys::obs_sceneitem_get_source(item);
+                        if !src.is_null() {
+                            if let Some(vol) = it.get("volume").and_then(|x| x.as_f64()) {
+                                sys::obs_source_set_volume(src, vol as f32);
+                            }
+                            if let Some(muted) = it.get("muted").and_then(|x| x.as_bool()) {
+                                sys::obs_source_set_muted(src, muted);
+                            }
+                            if let Some(sync_ns) = it.get("sync_offset_ns").and_then(|x| x.as_i64()) {
+                                sys::obs_source_set_sync_offset(src, sync_ns);
+                            }
+                            if let Some(bal) = it.get("balance").and_then(|x| x.as_f64()) {
+                                sys::obs_source_set_balance_value(src, bal as f32);
+                            }
+                            if let Some(mx) = it.get("audio_mixers").and_then(|x| x.as_u64()) {
+                                sys::obs_source_set_audio_mixers(src, mx as u32);
+                            }
+                            if let Some(mt) = it.get("monitoring_type").and_then(|x| x.as_i64()) {
+                                sys::obs_source_set_monitoring_type(src, mt as i32);
+                            }
+
+                            if let Some(filters) = it.get("filters").and_then(|x| x.as_array()) {
+                                for flt in filters {
+                                    let fid = flt.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                                    let fname = flt.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                                    let fenabled = flt.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
+                                    let fset = flt.get("settings").map(|v| v.to_string()).unwrap_or_default();
+                                    if fid.is_empty() || fname.is_empty() { continue; }
+                                    if let (Ok(cfid), Ok(cfn)) = (CString::new(fid), CString::new(fname)) {
+                                        let existing_flt = sys::obs_source_get_filter_by_name(src, cfn.as_ptr());
+                                        if !existing_flt.is_null() {
+                                            sys::obs_source_set_enabled(existing_flt, fenabled);
+                                            sys::obs_source_release(existing_flt);
+                                        } else {
+                                            let data = if !fset.is_empty() {
+                                                CString::new(fset).ok().map(|cj| sys::obs_data_create_from_json(cj.as_ptr())).unwrap_or(ptr::null_mut())
+                                            } else {
+                                                sys::obs_data_create()
+                                            };
+                                            let fptr = sys::obs_source_create(cfid.as_ptr(), cfn.as_ptr(), data, ptr::null_mut());
+                                            if !data.is_null() { sys::obs_data_release(data); }
+                                            if !fptr.is_null() {
+                                                sys::obs_source_set_enabled(fptr, fenabled);
+                                                sys::obs_source_filter_add(src, fptr);
+                                                sys::obs_source_release(fptr);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
+            }
+        }
+
+        if let Some(active_idx) = val.get("active_scene_idx").and_then(|x| x.as_u64()) {
+            let idx = active_idx as usize;
+            if idx < state.scenes.len() {
+                let _ = switch_program_scene(state, idx);
             }
         }
         return JNI_TRUE;
@@ -1781,7 +2089,53 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeGetLoadedInputsJs
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeSetRemoteControl(
+    mut env: JNIEnv,
+    _class: JClass,
+    enabled: jboolean,
+    lan_access: jboolean,
+    auth_token: JString,
+) -> jboolean {
+    if enabled == JNI_FALSE {
+        ws_server::stop_obs_websocket_server();
+        web_remote::stop_web_remote_server();
+        return JNI_TRUE;
+    }
+    let Ok(token): Result<String, _> = env.get_string(&auth_token).map(|s| s.into()) else {
+        return JNI_FALSE;
+    };
+    let lan = lan_access != JNI_FALSE;
+    let ok_ws = ws_server::start_obs_websocket_server(4455, lan, &token);
+    let ok_web = web_remote::start_web_remote_server(8080, lan, &token);
+    if ok_ws && ok_web {
+        JNI_TRUE
+    } else {
+        ws_server::stop_obs_websocket_server();
+        web_remote::stop_web_remote_server();
+        JNI_FALSE
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeGetRemoteStatusJson(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let json = serde_json::json!({
+        "enabled": ws_server::is_running(),
+        "lanAccess": ws_server::is_lan_enabled(),
+        "token": ws_server::current_auth_token(),
+        "wsPort": 4455,
+        "webPort": 8080,
+    })
+    .to_string();
+    env.new_string(json).map(|s| s.into_raw()).unwrap_or(ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeShutdown(_env: JNIEnv, _class: JClass) {
+    ws_server::stop_obs_websocket_server();
+    web_remote::stop_web_remote_server();
     let mut guard = STATE.lock().unwrap();
     if let Some(mut state) = guard.take() {
         if let Some(rec) = state.recording.take() { unsafe { rec.stop_and_release(); } }

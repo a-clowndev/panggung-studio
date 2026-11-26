@@ -96,14 +96,14 @@ fun InteractivePreviewCanvas(
         }
     }
 
+    val canvasRatio = (baseWidth.coerceAtLeast(1).toFloat() / baseHeight.coerceAtLeast(1).toFloat()).coerceIn(0.56f, 2.2f)
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Box(
+        BoxWithConstraints(
             modifier = Modifier
+                .weight(1f)
                 .fillMaxWidth()
-                .weight(1f, fill = false)
-                .aspectRatio((baseWidth.coerceAtLeast(1).toFloat() / baseHeight.coerceAtLeast(1).toFloat()).coerceIn(0.56f, 2.2f))
                 .clip(PanggungRadius.Card)
-                .background(Color.Black)
+                .background(Color(0xFF06080D))
                 .border(
                     width = 1.dp,
                     color = when {
@@ -113,7 +113,18 @@ fun InteractivePreviewCanvas(
                     },
                     shape = PanggungRadius.Card,
                 ),
+            contentAlignment = Alignment.Center,
         ) {
+            val containerRatio = if (maxHeight > 0.dp) maxWidth / maxHeight else canvasRatio
+            val fitByHeight = containerRatio > canvasRatio
+            val canvasMod = if (fitByHeight) {
+                Modifier.fillMaxHeight().aspectRatio(canvasRatio, matchHeightConstraintsFirst = true)
+            } else {
+                Modifier.fillMaxWidth().aspectRatio(canvasRatio, matchHeightConstraintsFirst = false)
+            }
+            Box(
+                modifier = canvasMod.background(Color.Black),
+            ) {
             if (obsReady) {
                 AndroidView(
                     modifier = Modifier.fillMaxSize(),
@@ -302,6 +313,7 @@ fun InteractivePreviewCanvas(
                 PreviewOverlayChip(label = if (previewLocked) "LOCKED" else "LOCK", active = previewLocked) {
                     previewLocked = !previewLocked
                 }
+            }
             }
         }
 

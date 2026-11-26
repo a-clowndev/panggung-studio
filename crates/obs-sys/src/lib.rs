@@ -269,9 +269,13 @@ unsafe extern "C" {
     pub fn obs_sceneitem_get_scale(item: *const obs_sceneitem_t, scale: *mut vec2);
     pub fn obs_sceneitem_get_rot(item: *const obs_sceneitem_t) -> c_float;
     pub fn obs_sceneitem_set_bounds_type(item: *mut obs_sceneitem_t, bounds_type: c_int);
+    pub fn obs_sceneitem_get_bounds_type(item: *const obs_sceneitem_t) -> c_int;
     pub fn obs_sceneitem_set_bounds(item: *mut obs_sceneitem_t, bounds: *const vec2);
+    pub fn obs_sceneitem_get_bounds(item: *const obs_sceneitem_t, bounds: *mut vec2);
     pub fn obs_sceneitem_set_alignment(item: *mut obs_sceneitem_t, alignment: u32);
+    pub fn obs_sceneitem_get_alignment(item: *const obs_sceneitem_t) -> u32;
     pub fn obs_sceneitem_set_bounds_alignment(item: *mut obs_sceneitem_t, alignment: u32);
+    pub fn obs_sceneitem_get_bounds_alignment(item: *const obs_sceneitem_t) -> u32;
     pub fn obs_source_media_play_pause(source: *mut obs_source_t, pause: bool);
     pub fn obs_source_media_restart(source: *mut obs_source_t);
     pub fn obs_source_set_name(source: *mut obs_source_t, name: *const c_char);
