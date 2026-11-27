@@ -103,7 +103,7 @@ mkdir -p "$JNI_OUT" "$ASSETS_OBS"
 "$CC" -shared -fPIC -O2 -Wl,-z,max-page-size=16384 \
     -I"$OBS_INSTALL/include" -I"$OBS_SRC/libobs" -I"$OBS_BUILD/config" -I"$DEPS_PREFIX/include" \
     "$ROOT_DIR/native/android-plugins/panggung-3p-pack.c" \
-    -L"$OBS_INSTALL/lib" -lobs -llog -lm \
+    -L"$OBS_INSTALL/lib" -L"$DEPS_PREFIX/lib" -lobs -lavformat -lavcodec -lavutil -llog -lm \
     -Wl,-soname,libobs-mod-panggung-3p-pack.so \
     -o "$JNI_OUT/libobs-mod-panggung-3p-pack.so"
 

@@ -137,8 +137,8 @@ fun AboutDialog(obsVersion: String, onDismiss: () -> Unit) {
         title = { Text("About Panggung Studio", fontSize = 15.sp) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("Panggung Studio v0.1.2 (Standalone Mobile Broadcast Studio)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                Text("Native Android Engine v0.1.2 (ARM64 GLES 3.2 + MediaCodec)", color = Color(0xFF14B8A6), fontSize = 12.sp)
+                Text("Panggung Studio v0.2.0 (Standalone Mobile Broadcast Studio)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                Text("Native Android Engine v0.2.0 (ARM64 GLES 3.2 + MediaCodec)", color = Color(0xFF14B8A6), fontSize = 12.sp)
                 Text("License: GNU General Public License v2.0 or later (GPL-2.0-or-later).", color = Color(0xFFCBD5E1), fontSize = 11.sp)
                 Text("Components: GLES 3.2 Compositor, FFmpeg 8.1 (SRT/DASH/x265/AOM), x264, FreeType2, SpeexDSP, mbedTLS, Lua 5.4, WebSocket Remote API.", color = Color(0xFF94A3B8), fontSize = 11.sp)
             }

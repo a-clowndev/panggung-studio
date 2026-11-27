@@ -120,8 +120,10 @@ data class SnapshotUi(
     val laggedFrames: Int = 0,
     val droppedFrames: Int = 0,
     val outputBytes: Long = 0L,
+    val congestion: Float = 0f,
     val recording: Boolean = false,
     val streaming: Boolean = false,
+    val wantStreaming: Boolean = false,
     val replayActive: Boolean = false,
 )
 
@@ -132,6 +134,8 @@ class MainActivity : ComponentActivity() {
     private var lastRecordPath by mutableStateOf("")
     private var statusBanner by mutableStateOf("Ready (Remote OFF)")
     private var floatingHubEnabled by mutableStateOf(true)
+    private var wantStreaming by mutableStateOf(false)
+    private var lastNetGen by mutableStateOf(0L)
 
     private lateinit var cameraCapture: Camera2Capture
     private lateinit var webViewCapture: WebViewCapture
@@ -190,8 +194,7 @@ class MainActivity : ComponentActivity() {
         webViewCapture = WebViewCapture(this)
         activeCameraToggle = { front ->
             runOnUiThread { addCamera(front, pipIfScreenActive = true) }
-            snapshot.sources.firstOrNull { it.id == "android_camera" }?.name
-                ?: if (front) "Front Camera" else "Back Camera"
+            if (front) "Front Camera" else "Back Camera"
         }
 
         val dataDir = File(filesDir, "obs-data")
@@ -268,25 +271,91 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Active Thermal Governor polling every 5s (T-E01)
+        // Dual-Loop Thermal + Network Congestion AIMD ABR polling every 2s (v0.2.0)
         LaunchedEffect(obsReady, bitrateKbps, snapshot.recording, snapshot.streaming) {
             while (obsReady) {
                 thermalState = ThermalGovernor.sampleAndApply(
                     context = this@MainActivity,
                     baseBitrateKbps = bitrateKbps.toInt(),
                     outputActive = snapshot.recording || snapshot.streaming,
+                    congestion = snapshot.congestion,
+                    droppedFrames = snapshot.droppedFrames,
                 )
-                delay(5000L)
+                if (snapshot.recording) {
+                    val recDir = getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: filesDir
+                    val freeMb = try { android.os.StatFs(recDir.absolutePath).availableBytes / (1024L * 1024L) } catch (_: Exception) { 9999L }
+                    if (freeMb < 100L) {
+                        NativeBridge.nativeStopRecording()
+                        recPaused = false
+                        statusBanner = "Recording stopped: low storage (${freeMb}MB free)"
+                        refreshSnapshot()
+                    }
+                }
+                if (thermalState.throttled && (snapshot.streaming || snapshot.recording)) {
+                    statusBanner = "ABR (${thermalState.abrReason}): ${thermalState.effectiveBitrateKbps} kbps"
+                }
+                delay(2000L)
             }
         }
 
+        // IRL Auto-Reconnect & Wi-Fi <-> 5G Handoff Recovery Loop (v0.2.0)
+        LaunchedEffect(obsReady, wantStreaming, rtmpUrl, streamKey, bitrateKbps) {
+            var retryAttempt = 0
+            // Grace period for initial RTMP/RTMPS/SRT handshake and FGS network callback registration
+            if (wantStreaming) {
+                delay(2500L)
+                lastNetGen = PanggungService.networkGeneration.get()
+            }
+            while (obsReady && wantStreaming) {
+                val curNetGen = PanggungService.networkGeneration.get()
+                val netChanged = curNetGen != lastNetGen
+                if (netChanged) lastNetGen = curNetGen
+
+                if (!snapshot.streaming || netChanged) {
+                    if (netChanged && snapshot.streaming) {
+                        statusBanner = "Network switched — reconnecting stream..."
+                        // Preserve authoritative WANT_STREAMING intent in Rust so reconnect never self-cancels
+                        NativeBridge.nativeStopStreamingForReconnect()
+                        delay(800L)
+                    }
+                    retryAttempt++
+                    if (retryAttempt <= 20) {
+                        val backoffSec = (1 shl (retryAttempt - 1).coerceAtMost(4)).coerceAtMost(16)
+                        statusBanner = "Reconnecting ($retryAttempt/20) in ${backoffSec}s..."
+                        delay(backoffSec * 1000L)
+                        if (!wantStreaming) break
+                        val ok = NativeBridge.nativeStartStreaming(rtmpUrl, streamKey, bitrateKbps.toInt())
+                        delay(2000L)
+                        refreshSnapshot()
+                        if (ok && snapshot.streaming) {
+                            statusBanner = "Stream reconnected LIVE!"
+                            retryAttempt = 0
+                        }
+                    } else {
+                        statusBanner = "Auto-reconnect paused after 20 retries"
+                        wantStreaming = false
+                    }
+                } else {
+                    retryAttempt = 0
+                    delay(2000L)
+                }
+            }
+        }
+
+        val startLiveWithGuard: () -> Unit = {
+            startFgs(ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+            val ok = NativeBridge.nativeStartStreaming(rtmpUrl, streamKey, bitrateKbps.toInt())
+            wantStreaming = ok
+            lastNetGen = PanggungService.networkGeneration.get()
+            statusBanner = if (ok) "Streaming LIVE" else "Stream start failed"
+            refreshSnapshot()
+        }
+
         val toggleLiveAction = {
-            if (snapshot.streaming) {
+            if (snapshot.streaming || wantStreaming) {
                 showConfirmStop = true
             } else {
-                val ok = NativeBridge.nativeStartStreaming(rtmpUrl, streamKey, bitrateKbps.toInt())
-                statusBanner = if (ok) "Streaming LIVE" else "Stream start failed"
-                refreshSnapshot()
+                startLiveWithGuard()
             }
         }
         val toggleRecAction = {
@@ -488,7 +557,7 @@ class MainActivity : ComponentActivity() {
                             },
                             onCheckUpdates = {
                                 coroutineScope.launch {
-                                    val curVer = try { packageManager.getPackageInfo(packageName, 0).versionName ?: "0.1.2" } catch (_: Exception) { "0.1.2" }
+                                    val curVer = try { packageManager.getPackageInfo(packageName, 0).versionName ?: "0.2.0" } catch (_: Exception) { "0.2.0" }
                                     statusBanner = ThermalGovernor.checkLatestRelease(curVer)
                                 }
                             },
@@ -652,7 +721,7 @@ class MainActivity : ComponentActivity() {
                                         ThermalGovernor.setKeepScreenOn(this@MainActivity, enabled)
                                     },
                                     onCheckUpdates = {
-                                        val curVer = try { packageManager.getPackageInfo(packageName, 0).versionName ?: "0.1.2" } catch (_: Exception) { "0.1.2" }
+                                        val curVer = try { packageManager.getPackageInfo(packageName, 0).versionName ?: "0.2.0" } catch (_: Exception) { "0.2.0" }
                                         coroutineScope.launch { statusBanner = ThermalGovernor.checkLatestRelease(curVer) }
                                     },
                                     onToggleDualCanvas = {
@@ -680,11 +749,14 @@ class MainActivity : ComponentActivity() {
             }
             if (showConfirmStop) {
                 ConfirmStopBroadcastDialog(
-                    isStreaming = snapshot.streaming,
+                    isStreaming = snapshot.streaming || wantStreaming,
                     isRecording = snapshot.recording,
                     onConfirm = {
-                        if (snapshot.streaming) NativeBridge.nativeStopStreaming()
+                        val wasStreaming = snapshot.streaming || wantStreaming
+                        wantStreaming = false
+                        if (wasStreaming) NativeBridge.nativeStopStreaming()
                         if (snapshot.recording) NativeBridge.nativeStopRecording()
+                        PanggungService.setBroadcastWakeLock(false)
                         recPaused = false
                         statusBanner = "Broadcast stopped cleanly"
                         showConfirmStop = false
@@ -755,7 +827,7 @@ class MainActivity : ComponentActivity() {
             if (showLogs) {
                 LogViewerDialog(
                     crashLog = NativeBridge.nativeGetLastCrashLog(),
-                    statusLog = "Panggung Engine v0.1.2 | ${snapshot.baseWidth}x${snapshot.baseHeight} | FPS=${snapshot.fps}\n$statusBanner",
+                    statusLog = "Panggung Engine v0.2.0 | ${snapshot.baseWidth}x${snapshot.baseHeight} | FPS=${snapshot.fps}\n$statusBanner",
                     onDismiss = { showLogs = false },
                 )
             }
@@ -1116,18 +1188,23 @@ class MainActivity : ComponentActivity() {
                     )
                 }
                 BroadcastButton(
-                    text = if (snapshot.streaming) "STOP LIVE" else "GO LIVE",
+                    text = if (snapshot.streaming || wantStreaming) "STOP LIVE" else "GO LIVE",
                     onClick = {
-                        if (snapshot.streaming) {
+                        if (snapshot.streaming || wantStreaming) {
+                            wantStreaming = false
                             NativeBridge.nativeStopStreaming()
                             statusBanner = "Stream stopped"
+                            refreshSnapshot()
                         } else {
+                            startFgs(ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
                             val ok = NativeBridge.nativeStartStreaming(rtmpUrl, streamKey, bitrateKbps.toInt())
+                            wantStreaming = ok
+                            lastNetGen = PanggungService.networkGeneration.get()
                             statusBanner = if (ok) "Streaming LIVE" else "Stream start failed"
+                            refreshSnapshot()
                         }
-                        refreshSnapshot()
                     },
-                    tone = if (snapshot.streaming) BroadcastTone.Danger else BroadcastTone.Live,
+                    tone = if (snapshot.streaming || wantStreaming) BroadcastTone.Danger else BroadcastTone.Live,
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -1409,9 +1486,11 @@ class MainActivity : ComponentActivity() {
                 }
             }
         } catch (_: Exception) {}
-        val sourceName = existing ?: name
-        if (existing == null) {
-            NativeBridge.nativeAddSource("android_camera", sourceName, "")
+        val sourceName = if (existing != null) {
+            if (existing != name && NativeBridge.nativeRenameSource(existing, name)) name else existing
+        } else {
+            NativeBridge.nativeAddSource("android_camera", name, "")
+            name
         }
         val sensorDeg = cameraCapture.start(front = front, width = 1280, height = 720)
         val rot = if (baseH > baseW) sensorDeg.toFloat() else 0f
@@ -1480,6 +1559,12 @@ class MainActivity : ComponentActivity() {
         } else {
             val dir = getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: filesDir
             dir.mkdirs()
+            val freeMb = try { android.os.StatFs(dir.absolutePath).availableBytes / (1024L * 1024L) } catch (_: Exception) { 9999L }
+            if (freeMb < 200L) {
+                statusBanner = "Low storage (${freeMb}MB free) — need >= 200MB to record"
+                refreshSnapshot()
+                return
+            }
             val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
             val outFile = File(dir, "panggung_$ts.mp4").absolutePath
             lastRecordPath = outFile
@@ -1551,10 +1636,17 @@ class MainActivity : ComponentActivity() {
                 laggedFrames = o.optInt("lagged_frames", 0),
                 droppedFrames = o.optInt("dropped_frames", 0),
                 outputBytes = o.optLong("output_bytes", 0L),
+                congestion = o.optDouble("congestion", 0.0).toFloat(),
                 recording = o.optBoolean("recording", false),
                 streaming = o.optBoolean("streaming", false),
+                wantStreaming = o.optBoolean("want_streaming", false),
                 replayActive = o.optBoolean("replay_active", false),
             )
+            // Single authoritative session state from Rust core: remote StopStream cancels Kotlin auto-reconnect immediately!
+            if (wantStreaming && !snapshot.wantStreaming) {
+                wantStreaming = false
+            }
+            PanggungService.setBroadcastWakeLock(snapshot.streaming || snapshot.recording || snapshot.wantStreaming)
         } catch (_: Exception) {}
     }
 

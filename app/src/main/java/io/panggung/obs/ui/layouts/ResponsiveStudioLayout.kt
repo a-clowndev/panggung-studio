@@ -187,7 +187,7 @@ private fun PhonePortraitLayout(
                         .border(1.dp, PanggungColors.TealPrimary, PanggungRadius.Badge)
                         .padding(horizontal = 5.dp, vertical = 1.dp),
                 ) {
-                    Text("STUDIO v0.1.2", color = PanggungColors.TealActive, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
+                    Text("STUDIO v0.2.0", color = PanggungColors.TealActive, fontSize = 9.sp, fontFamily = FontFamily.Monospace, maxLines = 1)
                 }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -215,7 +215,8 @@ private fun PhonePortraitLayout(
         // Dynamic Edge-Case Banners (Thermal / Crash Recovery)
         topBanners()
 
-        // 2. Interactive 16:9 Live Preview Canvas (Red Bounding Box + Safe Area + Lock)
+        // 2. Interactive Live Preview Canvas (bounded aspect ratio so bottom tabs & controls are ALWAYS visible in Portrait)
+        val portraitPreviewRatio = (snapshot.baseWidth.coerceAtLeast(1).toFloat() / snapshot.baseHeight.coerceAtLeast(1).toFloat()).coerceIn(1.25f, 2.0f)
         InteractivePreviewCanvas(
             obsReady = obsReady,
             baseWidth = snapshot.baseWidth,
@@ -226,6 +227,9 @@ private fun PhonePortraitLayout(
             streaming = snapshot.streaming,
             studioMode = snapshot.studioMode,
             transformVersion = transformVersion,
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(portraitPreviewRatio),
         )
 
         // 3. Contextual Source Toolbar (fits cleanly in 1 row)
@@ -341,6 +345,15 @@ private fun PhonePortraitLayout(
                 .padding(6.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
+            if (snapshot.studioMode) {
+                BroadcastButton(
+                    text = "CUT → PROGRAM",
+                    onClick = callbacks.onTransitionToProgram,
+                    tone = BroadcastTone.Warning,
+                    modifier = Modifier.fillMaxWidth(),
+                    compact = true,
+                )
+            }
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 BroadcastButton(
                     text = if (snapshot.recording) "STOP REC" else "REC",
@@ -364,8 +377,8 @@ private fun PhonePortraitLayout(
                     compact = true,
                 )
                 BroadcastButton(
-                    text = if (snapshot.studioMode) "CUT" else "STUDIO",
-                    onClick = if (snapshot.studioMode) callbacks.onTransitionToProgram else callbacks.onToggleStudioMode,
+                    text = if (snapshot.studioMode) "STD ON" else "STUDIO",
+                    onClick = callbacks.onToggleStudioMode,
                     tone = if (snapshot.studioMode) BroadcastTone.Primary else BroadcastTone.Neutral,
                     modifier = Modifier.weight(1f),
                     compact = true,
@@ -622,7 +635,7 @@ private fun PhoneLandscape3ColLayout(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text("PANGGUNG STUDIO v0.1.2 • $statusBanner", color = PanggungColors.TextSecondary, fontSize = 9.sp, fontFamily = FontFamily.Monospace, maxLines = 1, modifier = Modifier.weight(1f))
+            Text("PANGGUNG STUDIO v0.2.0 • $statusBanner", color = PanggungColors.TextSecondary, fontSize = 9.sp, fontFamily = FontFamily.Monospace, maxLines = 1, modifier = Modifier.weight(1f))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = "[QR]",
@@ -871,7 +884,7 @@ private fun TabletFullSidebarLayout(
                 .padding(horizontal = 10.dp, vertical = 4.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
-            Text("PANGGUNG STUDIO v0.1.2 • $statusBanner", color = PanggungColors.TextSecondary, fontSize = 10.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f))
+            Text("PANGGUNG STUDIO v0.2.0 • $statusBanner", color = PanggungColors.TextSecondary, fontSize = 10.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f))
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = "[${if (orientationLock == "LANDSCAPE") "LAND" else if (orientationLock == "PORTRAIT") "PORT" else "AUTO"}]",

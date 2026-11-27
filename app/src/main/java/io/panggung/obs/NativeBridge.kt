@@ -70,6 +70,7 @@ object NativeBridge {
     external fun nativeStopReplayBuffer()
     external fun nativeStartStreaming(rtmpUrl: String, streamKey: String, bitrateKbps: Int): Boolean
     external fun nativeStopStreaming()
+    external fun nativeStopStreamingForReconnect()
 
     external fun nativeSetAudioAdvanced(name: String, syncMs: Int, balance: Float, mixers: Int, monitorType: Int): Boolean
     external fun nativeGetAudioAdvancedJson(name: String): String
@@ -91,6 +92,7 @@ object NativeBridge {
 
     // Fase A: Complete OBS Scene, Source, Media & Studio Mode T-Bar APIs
     external fun nativeMoveSourceOrder(name: String, direction: Int): Boolean
+    external fun nativeRenameSource(oldName: String, newName: String): Boolean
     external fun nativeSetSourceLocked(name: String, locked: Boolean): Boolean
     external fun nativeFitSourceToScreen(name: String): Boolean
     external fun nativeGetSourceTransformJson(name: String): String
@@ -105,6 +107,8 @@ object NativeBridge {
     external fun nativeFlipSource(name: String, horizontal: Boolean): Boolean
     external fun nativeResetSourceTransform(name: String): Boolean
     external fun nativeUpdateLiveBitrate(bitrateKbps: Int): Boolean
+    external fun nativeUpdateStreamBitrate(bitrateKbps: Int): Boolean
+    external fun nativeUpdateRecordingBitrate(bitrateKbps: Int): Boolean
 
     // Hardened Remote Control (disabled by default; opt-in with mandatory SHA-256 auth)
     external fun nativeSetRemoteControl(enabled: Boolean, lanAccess: Boolean, authToken: String): Boolean

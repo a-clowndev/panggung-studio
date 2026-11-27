@@ -3,6 +3,7 @@ mod lua_engine;
 mod obs_parity;
 mod studio_ops;
 mod web_remote;
+mod tls_config;
 mod ws_server;
 
 use std::ffi::{CStr, CString};
@@ -46,6 +47,8 @@ unsafe extern "C" fn volmeter_cb(
     }
 }
 
+static VOLMETERS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
 fn attach_volmeter_to_source(src: *mut sys::obs_source_t, name: &str) {
     unsafe {
         let vm = sys::obs_volmeter_create(0); // OBS_FADER_CUBIC
@@ -57,6 +60,23 @@ fn attach_volmeter_to_source(src: *mut sys::obs_source_t, name: &str) {
         if !sys::obs_volmeter_attach_source(vm, src) {
             sys::obs_volmeter_destroy(vm);
             let _ = Box::from_raw(boxed);
+        } else if let Ok(mut list) = VOLMETERS.lock() {
+            list.push((vm as usize, boxed as usize));
+        }
+    }
+}
+
+fn destroy_all_volmeters() {
+    let items: Vec<(usize, usize)> = VOLMETERS
+        .lock()
+        .map(|mut v| std::mem::take(&mut *v))
+        .unwrap_or_default();
+    for (vm_ptr, boxed_ptr) in items {
+        unsafe {
+            let vm = vm_ptr as *mut libc::c_void;
+            sys::obs_volmeter_detach_source(vm);
+            sys::obs_volmeter_destroy(vm);
+            let _ = Box::from_raw(boxed_ptr as *mut String);
         }
     }
 }
@@ -283,6 +303,7 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeInit(
     let Ok(data_dir): Result<String, _> = env.get_string(&data_dir).map(|s| s.into()) else { return JNI_FALSE; };
     let Ok(module_dir): Result<String, _> = env.get_string(&module_dir).map(|s| s.into()) else { return JNI_FALSE; };
     let Ok(config_dir): Result<String, _> = env.get_string(&config_dir).map(|s| s.into()) else { return JNI_FALSE; };
+    tls_config::set_config_dir(&config_dir);
 
     let last_crash_report = crash_handler::read_and_clear_last_crash(&config_dir);
     crash_handler::install_crash_handler(&config_dir);
@@ -773,14 +794,7 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeResetVideo(
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeSaveSceneCollection(
-    mut env: JNIEnv, _class: JClass, path: JString,
-) -> jboolean {
-    let Ok(path): Result<String, _> = env.get_string(&path).map(|s| s.into()) else { return JNI_FALSE; };
-    let guard = STATE.lock().unwrap();
-    let Some(state) = guard.as_ref() else { return JNI_FALSE; };
-
+fn save_scene_collection_locked(state: &AppState, path: &str) -> bool {
     let mut scenes_json = Vec::with_capacity(state.scenes.len());
     for sc in &state.scenes {
         let mut items_json = Vec::new();
@@ -915,21 +929,44 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeSaveSceneCollecti
 
     match serde_json::to_string_pretty(&doc) {
         Ok(s) => {
-            // Atomic write: write to .tmp, fsync, then POSIX rename to prevent corruption on crash
+            // Atomic write + .bak rotation: write to .tmp, fsync, backup last valid collection, then POSIX rename
             let tmp_path = format!("{path}.tmp");
+            let bak_path = format!("{path}.bak");
             let ok = (|| -> std::io::Result<()> {
                 use std::io::Write;
                 let mut f = std::fs::File::create(&tmp_path)?;
                 f.write_all(s.as_bytes())?;
                 f.sync_all()?;
+                if std::path::Path::new(&path).exists() {
+                    let _ = std::fs::copy(&path, &bak_path);
+                }
                 std::fs::rename(&tmp_path, &path)?;
                 Ok(())
             })()
             .is_ok();
-            if ok { JNI_TRUE } else { let _ = std::fs::remove_file(&tmp_path); JNI_FALSE }
+            if ok { true } else { let _ = std::fs::remove_file(&tmp_path); false }
         }
-        Err(_) => JNI_FALSE,
+        Err(_) => false,
     }
+}
+
+fn auto_save_scene_collection_locked(state: &AppState) {
+    if let Some(parent) = std::path::Path::new(&state.config_dir).parent() {
+        let p = parent.join("scene_collection.json");
+        if let Some(s) = p.to_str() {
+            let _ = save_scene_collection_locked(state, s);
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeSaveSceneCollection(
+    mut env: JNIEnv, _class: JClass, path: JString,
+) -> jboolean {
+    let Ok(path): Result<String, _> = env.get_string(&path).map(|s| s.into()) else { return JNI_FALSE; };
+    let guard = STATE.lock().unwrap();
+    let Some(state) = guard.as_ref() else { return JNI_FALSE; };
+    if save_scene_collection_locked(state, &path) { JNI_TRUE } else { JNI_FALSE }
 }
 
 /* ---- Snapshot & WebSocket internal helpers ---- */
@@ -964,8 +1001,10 @@ pub(crate) struct StudioSnapshot {
     pub lagged_frames: u32,
     pub dropped_frames: i32,
     pub output_bytes: u64,
+    pub congestion: f32,
     pub recording: bool,
     pub streaming: bool,
+    pub want_streaming: bool,
     pub replay_active: bool,
 }
 
@@ -977,8 +1016,8 @@ pub(crate) fn ws_get_snapshot() -> StudioSnapshot {
             transition_id: "".into(), transition_ms: 300, video_encoder_id: "".into(),
             base_width: 1280, base_height: 720, sources: vec![],
             fps: 0.0, frame_time_ms: 0.0, total_frames: 0, lagged_frames: 0,
-            dropped_frames: 0, output_bytes: 0,
-            recording: false, streaming: false, replay_active: false,
+            dropped_frames: 0, output_bytes: 0, congestion: 0.0,
+            recording: false, streaming: false, want_streaming: false, replay_active: false,
         };
     };
     let idx = if state.studio_mode { state.preview_scene_idx } else { state.active_scene_idx };
@@ -1008,12 +1047,18 @@ pub(crate) fn ws_get_snapshot() -> StudioSnapshot {
             }
         }
     }
-    let (dropped_frames, output_bytes) = if let Some(st) = &state.streaming {
-        unsafe { (sys::obs_output_get_frames_dropped(st.output), sys::obs_output_get_total_bytes(st.output)) }
+    let (dropped_frames, output_bytes, congestion) = if let Some(st) = &state.streaming {
+        unsafe {
+            (
+                sys::obs_output_get_frames_dropped(st.output),
+                sys::obs_output_get_total_bytes(st.output),
+                sys::obs_output_get_congestion(st.output),
+            )
+        }
     } else if let Some(rc) = &state.recording {
-        unsafe { (sys::obs_output_get_frames_dropped(rc.output), sys::obs_output_get_total_bytes(rc.output)) }
+        unsafe { (sys::obs_output_get_frames_dropped(rc.output), sys::obs_output_get_total_bytes(rc.output), 0.0) }
     } else {
-        (0, 0)
+        (0, 0, 0.0)
     };
     StudioSnapshot {
         scenes: state.scenes.iter().map(|s| s.name.clone()).collect(),
@@ -1032,8 +1077,10 @@ pub(crate) fn ws_get_snapshot() -> StudioSnapshot {
         lagged_frames: unsafe { sys::obs_get_lagged_frames() },
         dropped_frames,
         output_bytes,
+        congestion,
         recording: state.recording.as_ref().map(|r| unsafe { sys::obs_output_active(r.output) }).unwrap_or(false),
         streaming: state.streaming.as_ref().map(|s| unsafe { sys::obs_output_active(s.output) }).unwrap_or(false),
+        want_streaming: WANT_STREAMING.load(std::sync::atomic::Ordering::SeqCst),
         replay_active: state.replay.as_ref().map(|r| unsafe { sys::obs_output_active(r.output) }).unwrap_or(false),
     }
 }
@@ -1226,6 +1273,7 @@ pub(crate) fn ws_create_scene(name: &str) -> bool {
     let scene = unsafe { sys::obs_scene_create(c_name.as_ptr()) };
     if scene.is_null() { return false; }
     state.scenes.push(SceneEntry { name: name.to_string(), scene, sources: vec![] });
+    auto_save_scene_collection_locked(state);
     true
 }
 
@@ -1417,13 +1465,48 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeGetAudioAdvancedJ
     env.new_string(json).map(|s| s.into_raw()).unwrap_or(ptr::null_mut())
 }
 
+fn is_valid_scene_collection(v: &serde_json::Value) -> bool {
+    let Some(arr) = v.get("scenes").and_then(|s| s.as_array()) else {
+        return false;
+    };
+    arr.iter().any(|sc| {
+        let name = sc.as_str().or_else(|| sc.get("name").and_then(|n| n.as_str())).unwrap_or("");
+        !name.trim().is_empty()
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeLoadSceneCollection(
     mut env: JNIEnv, _class: JClass, path: JString,
 ) -> jboolean {
     let Ok(path): Result<String, _> = env.get_string(&path).map(|s| s.into()) else { return JNI_FALSE; };
-    let Ok(raw) = std::fs::read_to_string(&path) else { return JNI_FALSE; };
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else { return JNI_FALSE; };
+    let val = match std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
+        .filter(is_valid_scene_collection)
+    {
+        Some(v) => v,
+        None => {
+            // Corrupt or schema-invalid primary JSON (e.g. `{}` or empty scenes) -> quarantine to .corrupt & recover from .bak
+            let bak_path = format!("{path}.bak");
+            if std::path::Path::new(&path).exists() {
+                let _ = std::fs::rename(&path, format!("{path}.corrupt"));
+                log::warn!("Scene collection '{path}' was invalid/corrupt — quarantined and attempting .bak recovery");
+            }
+            match std::fs::read_to_string(&bak_path)
+                .ok()
+                .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
+                .filter(is_valid_scene_collection)
+            {
+                Some(v) => {
+                    let _ = std::fs::copy(&bak_path, &path);
+                    info!("Recovered valid scene collection cleanly from '{bak_path}'");
+                    v
+                }
+                None => return JNI_FALSE,
+            }
+        }
+    };
     let mut guard = STATE.lock().unwrap();
     let Some(state) = guard.as_mut() else { return JNI_FALSE; };
 
@@ -2034,12 +2117,15 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeGetSnapshotJson(
 
 /* ---- Hardware/Software Recording (MP4), Replay Buffer & RTMP Streaming ---- */
 
+static ENCODER_INSTANCE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 unsafe fn create_av_encoders(encoder_id: &str, bitrate_kbps: i64) -> Option<(*mut sys::obs_encoder_t, *mut sys::obs_encoder_t)> {
+    let seq = ENCODER_INSTANCE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut v_data = ObsData::new().ok()?;
     let _ = v_data.set_int("bitrate", bitrate_kbps);
     let _ = v_data.set_int("keyint_sec", 2);
     let v_id = CString::new(encoder_id).ok()?;
-    let v_name = CString::new("Video Encoder").unwrap();
+    let v_name = CString::new(format!("Video Encoder #{seq}")).unwrap();
     let v_enc = unsafe { sys::obs_video_encoder_create(v_id.as_ptr(), v_name.as_ptr(), v_data.as_ptr(), ptr::null_mut()) };
     if v_enc.is_null() {
         error!("Failed to create video encoder {encoder_id}");
@@ -2050,7 +2136,7 @@ unsafe fn create_av_encoders(encoder_id: &str, bitrate_kbps: i64) -> Option<(*mu
     let mut a_data = ObsData::new().ok()?;
     let _ = a_data.set_int("bitrate", 128);
     let a_id = CString::new("ffmpeg_aac").unwrap();
-    let a_name = CString::new("FFmpeg AAC").unwrap();
+    let a_name = CString::new(format!("FFmpeg AAC #{seq}")).unwrap();
     let a_enc = unsafe { sys::obs_audio_encoder_create(a_id.as_ptr(), a_name.as_ptr(), a_data.as_ptr(), 0, ptr::null_mut()) };
     if a_enc.is_null() {
         unsafe { sys::obs_encoder_release(v_enc); }
@@ -2076,29 +2162,169 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeStopRecording(_en
     info!("Recording stopped");
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeStartStreaming(
-    mut env: JNIEnv, _class: JClass, rtmp_url: JString, stream_key: JString, bitrate_kbps: jint,
-) -> jboolean {
-    let Ok(url): Result<String, _> = env.get_string(&rtmp_url).map(|s| s.into()) else { return JNI_FALSE; };
-    let Ok(key): Result<String, _> = env.get_string(&stream_key).map(|s| s.into()) else { return JNI_FALSE; };
+static WS_STREAM_CFG: Mutex<Option<(String, String, i64)>> = Mutex::new(None);
+static WANT_STREAMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn redact_url_for_log(url: &str) -> String {
+    // Strip both userinfo (user:pass@) and query parameters (?passphrase=...&streamid=...)
+    let (base, has_q) = match url.find('?') {
+        Some(idx) => (&url[..idx], true),
+        None => (url, false),
+    };
+    let clean_base = if let Some(scheme_pos) = base.find("://") {
+        let after_scheme = &base[scheme_pos + 3..];
+        if let Some(at_pos) = after_scheme.find('@') {
+            format!("{}://[redacted]@{}", &base[..scheme_pos], &after_scheme[at_pos + 1..])
+        } else {
+            base.to_string()
+        }
+    } else {
+        base.to_string()
+    };
+    if has_q { format!("{clean_base}?[redacted]") } else { clean_base }
+}
+
+pub(crate) fn ws_set_stream_service_settings(server: &str, key: &str, bitrate_kbps: i64) {
+    if let Ok(mut g) = WS_STREAM_CFG.lock() {
+        *g = Some((server.trim().to_string(), key.trim().to_string(), bitrate_kbps.clamp(600, 50_000)));
+    }
+}
+
+pub(crate) fn ws_get_stream_service_settings() -> (String, i64) {
+    WS_STREAM_CFG
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|(s, _, b)| (s.clone(), *b)))
+        .unwrap_or_else(|| (String::new(), 4500))
+}
+
+pub(crate) fn ws_start_stream() -> bool {
+    let cfg = WS_STREAM_CFG.lock().ok().and_then(|g| g.clone());
+    let Some((url, key, br)) = cfg else { return false; };
+    if url.is_empty() { return false; }
+    start_streaming_internal(&url, &key, br)
+}
+
+fn stop_streaming_internal(clear_intent: bool) -> bool {
+    // Acquire STATE mutex FIRST so WANT_STREAMING transitions are strictly serialized against start_streaming_internal()
     let mut guard = STATE.lock().unwrap();
-    let Some(state) = guard.as_mut() else { return JNI_FALSE; };
-    if state.streaming.is_some() { return JNI_TRUE; }
+    if clear_intent {
+        WANT_STREAMING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    if let Some(state) = guard.as_mut() {
+        if let Some(st) = state.streaming.take() {
+            unsafe { st.stop_and_release(); }
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn ws_stop_stream() -> bool {
+    stop_streaming_internal(true)
+}
+
+pub(crate) fn ws_get_stream_status() -> (bool, u64, i32, f32) {
+    let guard = STATE.lock().unwrap();
+    let Some(state) = guard.as_ref() else { return (false, 0, 0, 0.0); };
+    if let Some(st) = &state.streaming {
+        unsafe {
+            let active = sys::obs_output_active(st.output);
+            let bytes = sys::obs_output_get_total_bytes(st.output);
+            let dropped = sys::obs_output_get_frames_dropped(st.output);
+            let congestion = sys::obs_output_get_congestion(st.output);
+            (active, bytes, dropped, congestion)
+        }
+    } else {
+        (false, 0, 0, 0.0)
+    }
+}
+
+fn start_streaming_internal(url: &str, key: &str, bitrate_kbps: i64) -> bool {
+    let mut guard = STATE.lock().unwrap();
+    let Some(state) = guard.as_mut() else { return false; };
+    if let Some(existing) = &state.streaming {
+        let still_active = unsafe { sys::obs_output_active(existing.output) };
+        if still_active {
+            return true;
+        }
+        // Clean up dropped/disconnected output before reconnecting
+        if let Some(dead) = state.streaming.take() {
+            unsafe { dead.stop_and_release(); }
+        }
+    }
 
     let enc_id = state.video_encoder_id.clone();
+    let lower_url = url.trim().to_ascii_lowercase();
+    let is_srt_or_udp = lower_url.starts_with("srt://") || lower_url.starts_with("udp://");
+    let safe_url = redact_url_for_log(url.trim());
+    if is_srt_or_udp {
+        // Strict codec compatibility gate for MPEG-TS/SRT: only H.264 & HEVC supported (reject AV1/VP9)
+        let enc_lower = enc_id.to_ascii_lowercase();
+        let is_supported_srt_codec = enc_lower.contains("h264") || enc_lower.contains("264")
+            || enc_lower.contains("hevc") || enc_lower.contains("265");
+        if !is_supported_srt_codec {
+            log::warn!("SRT/UDP rejected unsupported video encoder '{}' (only H.264/HEVC supported)", enc_id);
+            return false;
+        }
+    }
     unsafe {
-        let Some((v_enc, a_enc)) = create_av_encoders(&enc_id, bitrate_kbps as i64) else { return JNI_FALSE; };
-        let Ok(mut svc_data) = ObsData::new() else { return JNI_FALSE; };
-        let _ = svc_data.set_string("server", &url);
-        let _ = svc_data.set_string("key", &key);
+        let Some((v_enc, a_enc)) = create_av_encoders(&enc_id, bitrate_kbps) else { return false; };
+        if is_srt_or_udp {
+            // First-class in-process Hardware-Encoded SRT / UDP MPEG-TS streaming via `panggung_srt_output`
+            // Uses OBS's selected hardware MediaCodec H.264/HEVC (or x264) + AAC encoders,
+            // supports live ABR bitrate updates via obs_encoder_update() AND real congestion metrics!
+            let mut full_url = if !key.trim().is_empty() && !url.contains("streamid=") {
+                let sep = if url.contains('?') { "&" } else { "?" };
+                format!("{url}{sep}streamid={}", key.trim())
+            } else {
+                url.to_string()
+            };
+            if lower_url.starts_with("srt://") && !full_url.contains("connect_timeout=") {
+                let sep = if full_url.contains('?') { "&" } else { "?" };
+                full_url.push_str(&format!("{sep}connect_timeout=3000"));
+            }
+            let Ok(mut out_data) = ObsData::new() else {
+                sys::obs_encoder_release(v_enc);
+                sys::obs_encoder_release(a_enc);
+                return false;
+            };
+            let _ = out_data.set_string("url", &full_url);
+            let out_id = CString::new("panggung_srt_output").unwrap();
+            let out_name = CString::new("SRT Stream").unwrap();
+            let output = sys::obs_output_create(out_id.as_ptr(), out_name.as_ptr(), out_data.as_ptr(), ptr::null_mut());
+            if output.is_null() {
+                sys::obs_encoder_release(v_enc);
+                sys::obs_encoder_release(a_enc);
+                return false;
+            }
+            sys::obs_output_set_video_encoder(output, v_enc);
+            sys::obs_output_set_audio_encoder(output, a_enc, 0);
+            if !sys::obs_output_start(output) {
+                sys::obs_output_release(output);
+                sys::obs_encoder_release(v_enc);
+                sys::obs_encoder_release(a_enc);
+                return false;
+            }
+            WANT_STREAMING.store(true, std::sync::atomic::Ordering::SeqCst);
+            info!("SRT/MPEG-TS in-process stream started ({enc_id}) -> {safe_url}");
+            state.streaming = Some(OutputBundle { output, v_enc, a_enc, service: ptr::null_mut() });
+            return true;
+        }
+        let Ok(mut svc_data) = ObsData::new() else {
+            sys::obs_encoder_release(v_enc);
+            sys::obs_encoder_release(a_enc);
+            return false;
+        };
+        let _ = svc_data.set_string("server", url);
+        let _ = svc_data.set_string("key", key);
         let svc_id = CString::new("rtmp_custom").unwrap();
         let svc_name = CString::new("Custom RTMP").unwrap();
         let service = sys::obs_service_create(svc_id.as_ptr(), svc_name.as_ptr(), svc_data.as_ptr(), ptr::null_mut());
         if service.is_null() {
             sys::obs_encoder_release(v_enc);
             sys::obs_encoder_release(a_enc);
-            return JNI_FALSE;
+            return false;
         }
         let out_id = CString::new("rtmp_output").unwrap();
         let out_name = CString::new("RTMP Stream").unwrap();
@@ -2107,7 +2333,7 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeStartStreaming(
             sys::obs_service_release(service);
             sys::obs_encoder_release(v_enc);
             sys::obs_encoder_release(a_enc);
-            return JNI_FALSE;
+            return false;
         }
         sys::obs_output_set_service(output, service);
         sys::obs_output_set_video_encoder(output, v_enc);
@@ -2117,22 +2343,37 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeStartStreaming(
             sys::obs_service_release(service);
             sys::obs_encoder_release(v_enc);
             sys::obs_encoder_release(a_enc);
-            return JNI_FALSE;
+            return false;
         }
-        info!("RTMP stream started ({enc_id}) -> {url}");
+        WANT_STREAMING.store(true, std::sync::atomic::Ordering::SeqCst);
+        info!("RTMP/RTMPS stream started ({enc_id}) -> {safe_url}");
         state.streaming = Some(OutputBundle { output, v_enc, a_enc, service });
     }
-    JNI_TRUE
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeStartStreaming(
+    mut env: JNIEnv, _class: JClass, rtmp_url: JString, stream_key: JString, bitrate_kbps: jint,
+) -> jboolean {
+    let Ok(url): Result<String, _> = env.get_string(&rtmp_url).map(|s| s.into()) else { return JNI_FALSE; };
+    let Ok(key): Result<String, _> = env.get_string(&stream_key).map(|s| s.into()) else { return JNI_FALSE; };
+    ws_set_stream_service_settings(&url, &key, bitrate_kbps as i64);
+    if start_streaming_internal(&url, &key, bitrate_kbps as i64) { JNI_TRUE } else { JNI_FALSE }
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeStopStreaming(_env: JNIEnv, _class: JClass) {
-    let mut guard = STATE.lock().unwrap();
-    if let Some(state) = guard.as_mut() {
-        if let Some(st) = state.streaming.take() {
-            unsafe { st.stop_and_release(); }
-            info!("RTMP stream stopped");
-        }
+    if stop_streaming_internal(true) {
+        info!("Stream stopped cleanly");
+    }
+}
+
+/// Stops & releases active stream output during network-handoff reconnect WITHOUT clearing WANT_STREAMING intent.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeStopStreamingForReconnect(_env: JNIEnv, _class: JClass) {
+    if stop_streaming_internal(false) {
+        info!("Stream output stopped for network reconnect (intent preserved)");
     }
 }
 
@@ -2185,6 +2426,8 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeGetRemoteStatusJs
     let json = serde_json::json!({
         "enabled": ws_server::is_running(),
         "lanAccess": ws_server::is_lan_enabled(),
+        "tlsEnabled": ws_server::is_lan_enabled(),
+        "tlsFingerprint": tls_config::current_fingerprint(),
         "token": ws_server::current_auth_token(),
         "wsPort": 4455,
         "webPort": 8080,
@@ -2194,21 +2437,100 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeGetRemoteStatusJs
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeRenameSource(
+    mut env: JNIEnv,
+    _class: JClass,
+    old_name: JString,
+    new_name: JString,
+) -> jboolean {
+    let Ok(old_s): Result<String, _> = env.get_string(&old_name).map(|s| s.into()) else { return JNI_FALSE; };
+    let Ok(new_s): Result<String, _> = env.get_string(&new_name).map(|s| s.into()) else { return JNI_FALSE; };
+    if old_s.is_empty() || new_s.is_empty() || old_s == new_s { return JNI_TRUE; }
+    let Ok(c_old) = CString::new(old_s.as_str()) else { return JNI_FALSE; };
+    let Ok(c_new) = CString::new(new_s.as_str()) else { return JNI_FALSE; };
+    let mut guard = STATE.lock().unwrap();
+    let Some(state) = guard.as_mut() else { return JNI_FALSE; };
+    unsafe {
+        let src = sys::obs_get_source_by_name(c_old.as_ptr());
+        if src.is_null() { return JNI_FALSE; }
+        sys::obs_source_set_name(src, c_new.as_ptr());
+        let actual_ptr = sys::obs_source_get_name(src);
+        let actual_name = if actual_ptr.is_null() {
+            new_s.clone()
+        } else {
+            CStr::from_ptr(actual_ptr).to_string_lossy().into_owned()
+        };
+        sys::obs_source_release(src);
+        for sc in state.scenes.iter_mut() {
+            for s in sc.sources.iter_mut() {
+                if *s == old_s {
+                    *s = actual_name.clone();
+                }
+            }
+        }
+    }
+    JNI_TRUE
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeShutdown(_env: JNIEnv, _class: JClass) {
+    WANT_STREAMING.store(false, std::sync::atomic::Ordering::SeqCst);
     ws_server::stop_obs_websocket_server();
     web_remote::stop_web_remote_server();
     let mut guard = STATE.lock().unwrap();
     if let Some(mut state) = guard.take() {
+        // 1. Stop all active outputs first
         if let Some(rec) = state.recording.take() { unsafe { rec.stop_and_release(); } }
         if let Some(st) = state.streaming.take() { unsafe { st.stop_and_release(); } }
         if let Some(rp) = state.replay.take() { unsafe { rp.stop_and_release(); } }
+        for ms in state.multistreams.drain(..) { unsafe { ms.stop_and_release(); } }
+        if let Some(co) = state.custom_output.take() { unsafe { co.stop_and_release(); } }
+
+        // 2. Detach & destroy all volmeters before releasing sources
+        destroy_all_volmeters();
+
         unsafe {
-            if !state.display.is_null() { sys::obs_display_destroy(state.display); }
-            if !state.native_window.is_null() { ANativeWindow_release(state.native_window); }
-            sys::obs_set_output_source(0, ptr::null_mut());
-            if !state.transition.is_null() { sys::obs_source_release(state.transition); }
-            for sc in state.scenes { sys::obs_scene_release(sc.scene); }
+            // 3. Destroy displays & dual-canvas views
+            if !state.display.is_null() {
+                sys::obs_display_destroy(state.display);
+                state.display = ptr::null_mut();
+            }
+            if !state.native_window.is_null() {
+                ANativeWindow_release(state.native_window);
+                state.native_window = ptr::null_mut();
+            }
+            if !state.projector_display.is_null() {
+                sys::obs_display_destroy(state.projector_display);
+                state.projector_display = ptr::null_mut();
+            }
+            if !state.projector_window.is_null() {
+                ANativeWindow_release(state.projector_window);
+                state.projector_window = ptr::null_mut();
+            }
+            if !state.vertical_view.is_null() {
+                sys::obs_view_remove(state.vertical_view);
+                sys::obs_view_destroy(state.vertical_view);
+                state.vertical_view = ptr::null_mut();
+            }
+
+            // 4. Clear all OBS output channels & transition references
+            for ch in 0..64u32 {
+                sys::obs_set_output_source(ch, ptr::null_mut());
+            }
+            if !state.transition.is_null() {
+                sys::obs_transition_clear(state.transition);
+                sys::obs_source_release(state.transition);
+                state.transition = ptr::null_mut();
+            }
+
+            // 5. Release all scenes while libobs modules (e.g. text-freetype2) are still loaded
+            for sc in state.scenes.drain(..) {
+                sys::obs_scene_release(sc.scene);
+            }
         }
+
+        // 6. Flush deferred source destruction on OBS video thread BEFORE obs_shutdown() unloads modules (prevents FT_Done_Face after FT_Done_FreeType)
+        std::thread::sleep(std::time::Duration::from_millis(120));
         drop(state.ctx);
     }
     info!("libobs shut down cleanly");

@@ -46,7 +46,19 @@ jobs:
           VER="${TAG#v}"
           BASE="${VER%%-*}"
           IFS='.' read -r MAJ MIN PAT <<< "$BASE"
-          VCODE=$((MAJ * 10000 + MIN * 100 + PAT))
+          PRE_RANK=99
+          if [[ "$VER" == *-* ]]; then
+            PRE="${VER#*-}"
+            NUM="${PRE##*.}"
+            [[ "$NUM" =~ ^[0-9]+$ ]] || NUM=1
+            case "$PRE" in
+              alpha*) PRE_RANK=$(( NUM > 29 ? 29 : NUM )) ;;
+              beta*)  PRE_RANK=$(( 30 + (NUM > 29 ? 29 : NUM) )) ;;
+              rc*)    PRE_RANK=$(( 60 + (NUM > 29 ? 29 : NUM) )) ;;
+              *)      PRE_RANK=1 ;;
+            esac
+          fi
+          VCODE=$((MAJ * 1000000 + MIN * 10000 + PAT * 100 + PRE_RANK))
           if [[ "$VCODE" -lt 1 ]]; then VCODE=1; fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version_name=$VER" >> "$GITHUB_OUTPUT"
@@ -148,29 +160,48 @@ jobs:
           cat dist/SHA256SUMS.txt
 
       - name: Generate Release Notes
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          VCODE: ${{ steps.ver.outputs.version_code }}
+          REPO: ${{ github.repository }}
         run: |
-          cat > dist/RELEASE_NOTES.md << 'EOF'
-          Standalone Live Streaming & Recording Studio for Android 10+ · `arm64-v8a` · `io.panggung.obs`
+          PREV_TAG="$(git tag --sort=-v:refname | grep -Fxv "$TAG" | head -n 1 || true)"
+          if [ -n "$PREV_TAG" ]; then
+            COMMITS="$(git log "${PREV_TAG}..HEAD" --no-merges --pretty=format:"- %s (\`%h\`)" || true)"
+            COMPARE_LINE="**Full Changelog**: https://github.com/${REPO}/compare/${PREV_TAG}...${TAG}"
+          else
+            COMMITS="$(git log -n 20 --no-merges --pretty=format:"- %s (\`%h\`)" || true)"
+            COMPARE_LINE=""
+          fi
+          [ -n "$COMMITS" ] || COMMITS="- Release ${TAG}"
+          APK_NAME="Panggung-Studio-${TAG}-arm64-v8a-release.apk"
+          SHA256_VAL="$(awk '{print $1}' dist/SHA256SUMS.txt)"
 
-          ### Highlights (EN)
-
-          - **Engine & Encoding:** Cross-compiled `libobs 33.0.3`, custom `libobs-gles` (GLES 3.2 + `AHardwareBuffer` zero-copy), 10-bit HDR PQ/HLG, and hardware `MediaCodec` (H.264 / HEVC / HEVC HDR / AV1 / VP9) + `x264` / `x265` / `libaom`.
-          - **In-Game Floating Studio Hub:** Draggable `● LIVE` pill with 1-tap `REC`, `MIC`, `CAM` (drag, corner `◢` / `S·M·L` resize, `FRONT`/`BACK` flip, `↻ 90°` rotate, `⇄ H`/`⇅ V` mirror), `LAYOUT` (`SPLIT 2`, `3-SLOT`, `GAME+PiP`, `FULL CAM`), and `SCENE`.
-          - **TikTok Vertical 9:16 & Background Camera:** True `720×1280` / `1080×1920` Portrait live streaming with proportional zero-letterbox screen capture and `FGS=224` background-alive Camera2.
-
-          ### Ringkasan Rilis (ID)
-
-          - **Studio Broadcast Standalone (Tanpa PC):** Ditenagai `libobs 33.0.3`, GLES 3.2 Zero-Copy, 10-bit HDR, dan akselerasi hardware `MediaCodec`.
-          - **Floating Studio Hub di Dalam Game:** Atur posisi, ukuran, rotasi, flip kamera PiP, dan ganti layout TikTok 9:16 (`SPLIT 2`, `3-SLOT`, `GAME+PiP`, `FULL CAM`) langsung 1-tap saat main game.
-          - **Kamera Tetap Aktif & Layar Proporsional:** Kamera depan/belakang tidak mati saat masuk game (`FGS=224`) dan screen capture otomatis proporsional tanpa bar hitam.
-
-          ### Install / Cara Pasang
-
-          Download **`Panggung-Studio-${{ steps.ver.outputs.tag }}-arm64-v8a-release.apk`** below and install directly on Android 10+ (`arm64-v8a`), or via ADB:
-          ```sh
-          adb install --no-streaming -r Panggung-Studio-${{ steps.ver.outputs.tag }}-arm64-v8a-release.apk
-          ```
-          EOF
+          {
+            echo "Standalone Live Streaming & Recording Studio for Android 10+ · \`arm64-v8a\` · \`io.panggung.obs\` · \`versionCode ${VCODE}\`"
+            echo ""
+            if [[ "$TAG" == *-* ]]; then
+              echo "> **Pre-release (${TAG})**: Active development build for testing and feedback."
+              echo ""
+            fi
+            echo "### What's Changed in ${TAG}"
+            echo ""
+            echo "$COMMITS"
+            echo ""
+            if [ -n "$COMPARE_LINE" ]; then
+              echo "$COMPARE_LINE"
+              echo ""
+            fi
+            echo "### Install / Cara Pasang"
+            echo ""
+            echo "Download **\`${APK_NAME}\`** below and install directly on Android 10+ (\`arm64-v8a\`), or via ADB:"
+            echo '```sh'
+            echo "adb install --no-streaming -r ${APK_NAME}"
+            echo '```'
+            echo ""
+            echo "**SHA-256**: \`${SHA256_VAL}\`"
+          } > dist/RELEASE_NOTES.md
+          cat dist/RELEASE_NOTES.md
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -179,7 +210,7 @@ jobs:
           name: Panggung Studio ${{ steps.ver.outputs.tag }}
           body_path: dist/RELEASE_NOTES.md
           prerelease: ${{ github.event.inputs.prerelease == 'true' || contains(steps.ver.outputs.tag, '-') }}
-          generate_release_notes: true
+          generate_release_notes: false
           files: |
             dist/Panggung-Studio-${{ steps.ver.outputs.tag }}-arm64-v8a-release.apk
             dist/SHA256SUMS.txt

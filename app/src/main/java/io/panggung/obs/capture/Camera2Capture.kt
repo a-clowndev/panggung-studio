@@ -36,14 +36,21 @@ class Camera2Capture(private val context: Context) {
     private var reader: ImageReader? = null
     private var activeReqBuilder: CaptureRequest.Builder? = null
     private var currentFacingFront: Boolean? = null
+    @Volatile private var supportsOis: Boolean = false
+    @Volatile private var supportsEis: Boolean = false
 
     private var yBuf: ByteBuffer? = null
     private var uBuf: ByteBuffer? = null
     private var vBuf: ByteBuffer? = null
     private var rowScratch = ByteArray(0)
 
-    /** Pro Camera Controls (AP-12): Exposure Compensation, Zoom Ratio (Android 11+), Torch. */
-    fun setProControls(exposureComp: Int = 0, zoomRatio: Float = 1.0f, torchOn: Boolean = false) {
+    /** Pro Camera Controls (AP-12 / v0.2.0): Exposure, Zoom (Android 11+), Torch, and EIS/OIS Stabilization. */
+    fun setProControls(
+        exposureComp: Int = 0,
+        zoomRatio: Float = 1.0f,
+        torchOn: Boolean = false,
+        stabilization: Boolean = true,
+    ) {
         camHandler.post {
             val req = activeReqBuilder ?: return@post
             val s = session ?: return@post
@@ -56,6 +63,23 @@ class Camera2Capture(private val context: Context) {
                     CaptureRequest.FLASH_MODE,
                     if (torchOn) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF,
                 )
+                if (stabilization) {
+                    if (supportsOis) {
+                        // Prefer hardware OIS (zero crop); disable EIS when OIS is active per Camera2 spec
+                        req.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
+                        req.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+                    } else if (supportsEis) {
+                        req.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF)
+                        req.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)
+                    }
+                } else {
+                    if (supportsOis) {
+                        req.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF)
+                    }
+                    if (supportsEis) {
+                        req.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+                    }
+                }
                 s.setRepeatingRequest(req.build(), null, camHandler)
             } catch (e: Exception) {
                 Log.w("Camera2Capture", "setProControls: ${e.message}")
@@ -74,6 +98,10 @@ class Camera2Capture(private val context: Context) {
 
         val chars = mgr.getCameraCharacteristics(camId)
         val sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+        val oisModes = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION) ?: IntArray(0)
+        val eisModes = chars.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES) ?: IntArray(0)
+        supportsOis = oisModes.contains(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
+        supportsEis = eisModes.contains(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)
         val chosen = pickBestYuvSize(chars, width, height)
         currentFacingFront = front
 
@@ -139,6 +167,14 @@ class Camera2Capture(private val context: Context) {
                             val req = cam.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                                 addTarget(surface)
                                 set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                                // Enable hardware OIS (preferred, zero crop) or EIS fallback from frame #1
+                                if (supportsOis) {
+                                    set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
+                                    set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+                                } else if (supportsEis) {
+                                    set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF)
+                                    set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)
+                                }
                             }
                             activeReqBuilder = req
                             @Suppress("DEPRECATION")

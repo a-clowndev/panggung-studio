@@ -14,8 +14,8 @@ android {
         applicationId = "io.panggung.obs"
         minSdk = 29
         targetSdk = 35
-        versionCode = (project.findProperty("PANGGUNG_VERSION_CODE") as String?)?.toIntOrNull() ?: 102
-        versionName = (project.findProperty("PANGGUNG_VERSION_NAME") as String?) ?: "0.1.2"
+        versionCode = (project.findProperty("PANGGUNG_VERSION_CODE") as String?)?.toIntOrNull() ?: 20099
+        versionName = (project.findProperty("PANGGUNG_VERSION_NAME") as String?) ?: "0.2.0"
 
         ndk {
             abiFilters += listOf("arm64-v8a")

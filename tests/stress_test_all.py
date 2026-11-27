@@ -72,7 +72,7 @@ async def ws_req(ws, rtype, rdata=None):
 
 
 async def run_stress():
-    print("=== PANGGUNG STUDIO v0.1.0 — 7-STAGE ALL-FEATURES STRESS TEST ===", flush=True)
+    print("=== PANGGUNG STUDIO v0.2.0 — 7-STAGE ALL-FEATURES STRESS TEST ===", flush=True)
     adb("logcat", "-c")
     adb("shell", "pm", "clear", "io.panggung.obs")
     adb("shell", "pm", "grant", "io.panggung.obs", "android.permission.CAMERA")
@@ -82,6 +82,27 @@ async def run_stress():
     await asyncio.sleep(4.0)
     adb("forward", "tcp:4455", "tcp:4455")
     adb("forward", "tcp:8080", "tcp:8080")
+
+    # Auto-enable Remote Control & fetch fresh 16-char token after pm clear
+    global AUTH_TOKEN
+    if tap_text(text="QR", wait=1.2):
+        import xml.etree.ElementTree as ET
+        adb("shell", "uiautomator", "dump", "/sdcard/ui_stress.xml")
+        xml_str = adb("exec-out", "cat", "/sdcard/ui_stress.xml").stdout
+        root = ET.fromstring(xml_str)
+        for n in root.iter("node"):
+            if n.attrib.get("checkable") == "true" and n.attrib.get("checked") == "false":
+                b = re.findall(r"\d+", n.attrib.get("bounds", ""))
+                if len(b) == 4:
+                    adb("shell", "input", "tap", str((int(b[0])+int(b[2]))//2), str((int(b[1])+int(b[3]))//2))
+                    await asyncio.sleep(1.5)
+                    break
+        adb("shell", "uiautomator", "dump", "/sdcard/ui_stress.xml")
+        xml_str2 = adb("exec-out", "cat", "/sdcard/ui_stress.xml").stdout
+        toks = re.findall(r'text="([A-Za-z0-9]{16})"', xml_str2)
+        if toks:
+            AUTH_TOKEN = toks[0]
+        tap_text(text="Done", wait=0.8) or tap_text(text="Close", wait=0.8)
 
     rss_start = get_rss_mb()
     temp_start = get_batt_temp()

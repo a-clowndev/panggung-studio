@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::Read;
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
@@ -9,8 +9,8 @@ use std::time::Duration;
 use log::{error, info, warn};
 use serde_json::{Value, json};
 use tungstenite::protocol::frame::coding::CloseCode;
-use tungstenite::protocol::CloseFrame;
-use tungstenite::{Message, accept};
+use tungstenite::protocol::{CloseFrame, WebSocketConfig};
+use tungstenite::{Message, accept_with_config};
 
 use crate::{
     ws_add_filter, ws_create_scene, ws_get_audio_advanced_json, ws_get_snapshot,
@@ -25,7 +25,9 @@ use crate::{
 static WS_RUNNING: AtomicBool = AtomicBool::new(false);
 static WS_LAN_ACCESS: AtomicBool = AtomicBool::new(false);
 static WS_GENERATION: AtomicU64 = AtomicU64::new(0);
+static WS_ACTIVE_CLIENTS: AtomicUsize = AtomicUsize::new(0);
 static WS_AUTH_TOKEN: Mutex<String> = Mutex::new(String::new());
+const MAX_WS_CLIENTS: usize = 16;
 
 pub fn is_running() -> bool {
     WS_RUNNING.load(Ordering::SeqCst)
@@ -59,14 +61,27 @@ pub fn start_obs_websocket_server(port: u16, lan_access: bool, auth_token: &str)
         let mut tok = WS_AUTH_TOKEN.lock().unwrap();
         *tok = auth_token.to_string();
     }
+    let tls_cfg = if lan_access {
+        match crate::tls_config::get_or_init_lan_tls() {
+            Some(c) => Some(c),
+            None => {
+                error!("Refusing to start LAN obs-websocket without TLS");
+                return false;
+            }
+        }
+    } else {
+        None
+    };
+
     WS_LAN_ACCESS.store(lan_access, Ordering::SeqCst);
     let generation = WS_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     let bind_host = if lan_access { "0.0.0.0" } else { "127.0.0.1" };
     let addr = format!("{bind_host}:{port}");
+    let scheme = if lan_access { "wss" } else { "ws" };
     let listener = match TcpListener::bind(&addr) {
         Ok(l) => {
             let _ = l.set_nonblocking(true);
-            info!("obs-websocket v5 server listening on ws://{addr} (auth=REQUIRED, lan={lan_access})");
+            info!("obs-websocket v5 server listening on {scheme}://{addr} (auth=REQUIRED, tls={lan_access}, lan={lan_access})");
             l
         }
         Err(e) => {
@@ -84,9 +99,31 @@ pub fn start_obs_websocket_server(port: u16, lan_access: bool, auth_token: &str)
             while WS_RUNNING.load(Ordering::SeqCst) && WS_GENERATION.load(Ordering::SeqCst) == generation {
                 match listener.accept() {
                     Ok((stream, _peer)) => {
+                        if WS_ACTIVE_CLIENTS.load(Ordering::SeqCst) >= MAX_WS_CLIENTS {
+                            warn!("obs-websocket max concurrent clients ({MAX_WS_CLIENTS}) reached — rejecting");
+                            drop(stream);
+                            continue;
+                        }
                         let _ = stream.set_nonblocking(false);
+                        // Short read timeout so active sessions promptly detect server disable or token rotation
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
                         let tok = expected_token.clone();
-                        thread::spawn(move || handle_client(stream, &tok, generation));
+                        let tls_opt = tls_cfg.clone();
+                        WS_ACTIVE_CLIENTS.fetch_add(1, Ordering::SeqCst);
+                        thread::spawn(move || {
+                            if let Some(cfg) = tls_opt {
+                                match rustls::ServerConnection::new(cfg) {
+                                    Ok(conn) => {
+                                        let tls_stream = rustls::StreamOwned::new(conn, stream);
+                                        handle_client(tls_stream, &tok, generation);
+                                    }
+                                    Err(e) => warn!("WSS TLS connection init failed: {e}"),
+                                }
+                            } else {
+                                handle_client(stream, &tok, generation);
+                            }
+                            WS_ACTIVE_CLIENTS.fetch_sub(1, Ordering::SeqCst);
+                        });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(80));
@@ -106,10 +143,11 @@ fn is_session_valid(expected_gen: u64) -> bool {
     WS_RUNNING.load(Ordering::SeqCst) && WS_GENERATION.load(Ordering::SeqCst) == expected_gen
 }
 
-fn handle_client(stream: std::net::TcpStream, password: &str, expected_gen: u64) {
-    // Short read timeout so active sessions promptly detect server disable or token rotation
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-    let mut ws = match accept(stream) {
+fn handle_client<S: std::io::Read + std::io::Write>(stream: S, password: &str, expected_gen: u64) {
+    let mut ws_cfg = WebSocketConfig::default();
+    ws_cfg.max_message_size = Some(256 * 1024);
+    ws_cfg.max_frame_size = Some(64 * 1024);
+    let mut ws = match accept_with_config(stream, Some(ws_cfg)) {
         Ok(w) => w,
         Err(e) => {
             warn!("WS handshake failed: {e}");
@@ -344,8 +382,13 @@ fn dispatch_request(req_type: &str, data: &Value) -> (bool, Value) {
             (true, v)
         }
         "GetStreamStatus" => {
-            let snap = ws_get_snapshot();
-            (true, json!({ "outputActive": snap.streaming }))
+            let (active, bytes, dropped, congestion) = crate::ws_get_stream_status();
+            (true, json!({
+                "outputActive": active,
+                "outputBytes": bytes,
+                "outputSkippedFrames": dropped,
+                "outputCongestion": congestion
+            }))
         }
         "GetStats" => {
             let snap = ws_get_snapshot();
@@ -416,6 +459,23 @@ fn dispatch_request(req_type: &str, data: &Value) -> (bool, Value) {
             }
             (ws_remux_to_mp4(src, dst), json!({}))
         }
+        "SetStreamServiceSettings" => {
+            let s = data.get("streamServiceSettings").unwrap_or(data);
+            let server = s.get("server").and_then(|x| x.as_str()).unwrap_or("");
+            let key = s.get("key").and_then(|x| x.as_str()).unwrap_or("");
+            let br = s.get("bitrateKbps").and_then(|x| x.as_i64()).unwrap_or(4500);
+            crate::ws_set_stream_service_settings(server, key, br);
+            (true, json!({}))
+        }
+        "GetStreamServiceSettings" => {
+            let (server, br) = crate::ws_get_stream_service_settings();
+            (true, json!({
+                "streamServiceType": "rtmp_custom",
+                "streamServiceSettings": { "server": server, "bitrateKbps": br }
+            }))
+        }
+        "StartStream" => (crate::ws_start_stream(), json!({})),
+        "StopStream" => (crate::ws_stop_stream(), json!({})),
         "StartMultistream" => {
             let url = data.get("url").and_then(|x| x.as_str()).unwrap_or("");
             let key = data.get("key").and_then(|x| x.as_str()).unwrap_or("");
@@ -427,9 +487,22 @@ fn dispatch_request(req_type: &str, data: &Value) -> (bool, Value) {
             (true, json!({}))
         }
         "StartCustomOutput" => {
-            let oid = data.get("outputId").and_then(|x| x.as_str()).unwrap_or("null_output");
-            let url = data.get("url").and_then(|x| x.as_str()).unwrap_or("");
+            let oid = data.get("outputId").and_then(|x| x.as_str()).unwrap_or("");
+            let url = data.get("url").or_else(|| data.get("path")).and_then(|x| x.as_str()).unwrap_or("");
             let br = data.get("bitrateKbps").and_then(|x| x.as_i64()).unwrap_or(4500);
+            if oid.is_empty() {
+                return (false, json!({ "error": "Missing required outputId" }));
+            }
+            if oid != "null_output" {
+                let lower = url.trim().to_ascii_lowercase();
+                let is_net = lower.starts_with("rtmp://")
+                    || lower.starts_with("rtmps://")
+                    || lower.starts_with("srt://")
+                    || lower.starts_with("udp://");
+                if !is_net && !is_allowed_recording_path(url, false) {
+                    return (false, json!({ "error": "Custom output path outside allowed recording directory" }));
+                }
+            }
             (ws_start_custom_output(oid, url, br), json!({}))
         }
         "StopCustomOutput" => {
@@ -587,12 +660,18 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Canonical allowlist check for recording paths (prevents arbitrary filesystem access/remux).
+/// Canonical allowlist check for recording paths (prevents arbitrary filesystem access, traversal, and symlink attacks).
 pub fn is_allowed_recording_path(path: &str, must_exist: bool) -> bool {
     if path.is_empty() || path.contains("..") || path.contains('\0') {
         return false;
     }
     let p = std::path::Path::new(path);
+    // Reject symlinks directly at target path (both existing source and existing destination)
+    if let Ok(meta) = std::fs::symlink_metadata(p) {
+        if meta.file_type().is_symlink() {
+            return false;
+        }
+    }
     let canonical = if must_exist {
         match std::fs::canonicalize(p) {
             Ok(c) => c,
@@ -601,6 +680,11 @@ pub fn is_allowed_recording_path(path: &str, must_exist: bool) -> bool {
     } else {
         let Some(parent) = p.parent() else { return false; };
         let Some(fname) = p.file_name() else { return false; };
+        if let Ok(pmeta) = std::fs::symlink_metadata(parent) {
+            if pmeta.file_type().is_symlink() {
+                return false;
+            }
+        }
         match std::fs::canonicalize(parent) {
             Ok(cp) => cp.join(fname),
             Err(_) => return false,

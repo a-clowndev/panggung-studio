@@ -208,6 +208,7 @@ fun RemoteQrDialog(
     }
     var enabled by remember { mutableStateOf(initialStatus.optBoolean("enabled", false)) }
     var lanAccess by remember { mutableStateOf(initialStatus.optBoolean("lanAccess", false)) }
+    var tlsFingerprint by remember { mutableStateOf(initialStatus.optString("tlsFingerprint", "")) }
     var authToken by remember {
         mutableStateOf(
             initialStatus.optString("token", "").ifBlank { generateSecureRemoteToken() }
@@ -220,17 +221,23 @@ fun RemoteQrDialog(
             enabled = newEnabled
             lanAccess = newLan
             authToken = newToken
+            try {
+                val st = org.json.JSONObject(io.panggung.obs.NativeBridge.nativeGetRemoteStatusJson())
+                tlsFingerprint = st.optString("tlsFingerprint", "")
+            } catch (_: Exception) {}
             onStatusChanged(
                 if (!newEnabled) "Ready (Remote OFF)"
-                else if (newLan) "Remote ON (LAN :4455 + Auth)"
+                else if (newLan) "Remote ON (LAN TLS :4455 + Auth)"
                 else "Remote ON (127.0.0.1:4455)"
             )
         }
     }
 
     val host = if (lanAccess) getLocalIpv4Address() else "127.0.0.1"
-    val wsUrl = "ws://$host:4455"
-    val webUrl = "http://$host:8080/?token=$authToken"
+    val wsScheme = if (lanAccess) "wss" else "ws"
+    val httpScheme = if (lanAccess) "https" else "http"
+    val wsUrl = "$wsScheme://$host:4455"
+    val webUrl = "$httpScheme://$host:8080"
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -239,8 +246,8 @@ fun RemoteQrDialog(
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Remote Control (OBS WS v5)", color = PanggungColors.TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
                 Text(
-                    if (!enabled) "OFF" else if (lanAccess) "LAN + AUTH" else "LOCALHOST",
-                    color = if (!enabled) PanggungColors.TextMuted else if (lanAccess) PanggungColors.WarnBright else PanggungColors.LiveBright,
+                    if (!enabled) "OFF" else if (lanAccess) "LAN + TLS" else "LOCALHOST",
+                    color = if (!enabled) PanggungColors.TextMuted else if (lanAccess) PanggungColors.LiveBright else PanggungColors.TealActive,
                     fontSize = 10.sp,
                     fontWeight = FontWeight.Bold,
                     fontFamily = FontFamily.Monospace,
@@ -306,7 +313,16 @@ fun RemoteQrDialog(
                         Text("WebSocket API v5 (Companion / Stream Deck)", color = PanggungColors.TextMuted, fontSize = 10.sp)
                         Text(wsUrl, color = PanggungColors.LiveBright, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
                         Text("Web Remote UI (with token)", color = PanggungColors.TextMuted, fontSize = 10.sp)
-                        Text("http://$host:8080", color = PanggungColors.TealActive, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                        Text(webUrl, color = PanggungColors.TealActive, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                        if (lanAccess && tlsFingerprint.isNotBlank()) {
+                            Spacer(Modifier.height(2.dp))
+                            Text("TLS 1.3 Cert SHA-256 Fingerprint (Full)", color = PanggungColors.TextMuted, fontSize = 9.sp)
+                            Text(tlsFingerprint, color = PanggungColors.TextSecondary, fontSize = 8.sp, fontFamily = FontFamily.Monospace)
+                            BroadcastButton("Copy Cert FP", onClick = {
+                                val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                cm.setPrimaryClip(android.content.ClipData.newPlainText("Panggung TLS SHA-256", tlsFingerprint))
+                            }, compact = true, modifier = Modifier.fillMaxWidth())
+                        }
                     }
                 }
             }
