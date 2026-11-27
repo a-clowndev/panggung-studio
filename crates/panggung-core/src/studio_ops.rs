@@ -78,17 +78,45 @@ pub(crate) fn ws_get_source_transform_json(name: &str) -> String {
         if item.is_null() { return "{}".into(); }
         let mut pos = sys::vec2 { x: 0.0, y: 0.0 };
         let mut scale = sys::vec2 { x: 1.0, y: 1.0 };
+        let mut crop = sys::obs_sceneitem_crop::default();
         sys::obs_sceneitem_get_pos(item, &mut pos);
         sys::obs_sceneitem_get_scale(item, &mut scale);
+        sys::obs_sceneitem_get_crop(item, &mut crop);
         let rot = sys::obs_sceneitem_get_rot(item);
         let locked = sys::obs_sceneitem_locked(item);
+        let src = sys::obs_sceneitem_get_source(item);
+        let src_w = if !src.is_null() { sys::obs_source_get_width(src) } else { 0 };
+        let src_h = if !src.is_null() { sys::obs_source_get_height(src) } else { 0 };
         serde_json::json!({
             "x": pos.x, "y": pos.y,
             "scale_x": scale.x, "scale_y": scale.y,
             "rot": rot, "locked": locked,
+            "crop_left": crop.left, "crop_top": crop.top,
+            "crop_right": crop.right, "crop_bottom": crop.bottom,
+            "src_w": src_w, "src_h": src_h,
             "base_w": state.base_width, "base_h": state.base_height
         }).to_string()
     }
+}
+
+pub(crate) fn ws_set_source_crop(name: &str, left: i32, top: i32, right: i32, bottom: i32) -> bool {
+    let guard = STATE.lock().unwrap();
+    let Some(state) = guard.as_ref() else { return false; };
+    let idx = if state.studio_mode { state.preview_scene_idx } else { state.active_scene_idx };
+    let sc = &state.scenes[idx];
+    let Ok(c_name) = CString::new(name) else { return false; };
+    unsafe {
+        let item = sys::obs_scene_find_source(sc.scene, c_name.as_ptr());
+        if item.is_null() { return false; }
+        let crop = sys::obs_sceneitem_crop {
+            left: left.max(0),
+            top: top.max(0),
+            right: right.max(0),
+            bottom: bottom.max(0),
+        };
+        sys::obs_sceneitem_set_crop(item, &crop);
+    }
+    true
 }
 
 pub(crate) fn ws_rename_scene(idx: usize, new_name: &str) -> bool {
@@ -316,6 +344,14 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeGetSourceTransfor
 ) -> jstring {
     let n: String = env.get_string(&name).map(|s| s.into()).unwrap_or_default();
     env.new_string(ws_get_source_transform_json(&n)).map(|s| s.into_raw()).unwrap_or(ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeSetSourceCrop(
+    mut env: JNIEnv, _class: JClass, name: JString, left: jint, top: jint, right: jint, bottom: jint,
+) -> jboolean {
+    let Ok(n): Result<String, _> = env.get_string(&name).map(|s| s.into()) else { return JNI_FALSE; };
+    if ws_set_source_crop(&n, left, top, right, bottom) { JNI_TRUE } else { JNI_FALSE }
 }
 
 #[unsafe(no_mangle)]

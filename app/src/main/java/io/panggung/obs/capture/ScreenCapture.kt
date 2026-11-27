@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.PixelFormat
 import android.graphics.Point
+import android.hardware.HardwareBuffer
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.AudioAttributes
@@ -159,18 +160,30 @@ class ScreenCapture {
     }
 
     private fun createImageReader(width: Int, height: Int, h: Handler): ImageReader {
-        return ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 3).apply {
+        // Zero-Copy GPU AHardwareBuffer Screen Capture (USAGE_GPU_SAMPLED_IMAGE, zero CPU memcpy!)
+        return ImageReader.newInstance(
+            width,
+            height,
+            PixelFormat.RGBA_8888,
+            3,
+            HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
+        ).apply {
             setOnImageAvailableListener({ r ->
-                val img = r.acquireLatestImage() ?: return@setOnImageAvailableListener
+                val img = try { r.acquireLatestImage() } catch (_: Exception) { null } ?: return@setOnImageAvailableListener
                 try {
-                    val plane = img.planes[0]
-                    NativeBridge.nativePushScreenRgba(
-                        plane.buffer,
-                        plane.rowStride,
-                        img.width,
-                        img.height,
-                        img.timestamp,
-                    )
+                    val hb = img.hardwareBuffer
+                    if (hb != null) {
+                        try {
+                            NativeBridge.nativePushScreenHardwareBuffer(
+                                hb,
+                                img.width,
+                                img.height,
+                                img.timestamp,
+                            )
+                        } finally {
+                            hb.close()
+                        }
+                    }
                 } finally {
                     img.close()
                 }

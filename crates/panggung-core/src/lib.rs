@@ -469,6 +469,47 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeDetachSurface(
 
 /* ---- DirectByteBuffer frame & audio pushers ---- */
 
+#[link(name = "android")]
+unsafe extern "C" {
+    fn AHardwareBuffer_fromHardwareBuffer(
+        env: *mut jni::sys::JNIEnv,
+        hardware_buffer_obj: jni::sys::jobject,
+    ) -> *mut libc::c_void;
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativePushCameraHardwareBuffer(
+    mut env: JNIEnv, _class: JClass,
+    source_name: JString, hw_buf: JObject,
+    width: jint, height: jint, timestamp_ns: jlong,
+) -> jboolean {
+    let name: String = env.get_string(&source_name).map(|s| s.into()).unwrap_or_default();
+    let Ok(c_name) = CString::new(name) else { return JNI_FALSE; };
+    let ahb = unsafe { AHardwareBuffer_fromHardwareBuffer(env.get_raw(), hw_buf.as_raw()) };
+    if ahb.is_null() {
+        return JNI_FALSE;
+    }
+    let ok = unsafe {
+        sys::panggung_push_camera_ahb(c_name.as_ptr(), ahb, width.max(0) as u32, height.max(0) as u32, timestamp_ns as u64)
+    };
+    if ok { JNI_TRUE } else { JNI_FALSE }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativePushScreenHardwareBuffer(
+    env: JNIEnv, _class: JClass,
+    hw_buf: JObject, width: jint, height: jint, timestamp_ns: jlong,
+) -> jboolean {
+    let ahb = unsafe { AHardwareBuffer_fromHardwareBuffer(env.get_raw(), hw_buf.as_raw()) };
+    if ahb.is_null() {
+        return JNI_FALSE;
+    }
+    let ok = unsafe {
+        sys::panggung_push_screen_ahb(ahb, width.max(0) as u32, height.max(0) as u32, timestamp_ns as u64)
+    };
+    if ok { JNI_TRUE } else { JNI_FALSE }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativePushCameraI420(
     env: JNIEnv, _class: JClass,

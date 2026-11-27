@@ -18,6 +18,8 @@ target_link_libraries(
     OBS::libobs
     mediandk
     android
+    EGL
+    GLESv3
     log
 )
 

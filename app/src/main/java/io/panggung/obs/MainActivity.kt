@@ -52,6 +52,7 @@ import io.panggung.obs.androidplus.ThermalGovernor
 import io.panggung.obs.androidplus.ThermalState
 import io.panggung.obs.capture.AudioInputCapture
 import io.panggung.obs.capture.Camera2Capture
+import io.panggung.obs.capture.CameraLensInfo
 import io.panggung.obs.capture.LiveOverlaysEngine
 import io.panggung.obs.capture.WebViewCapture
 import io.panggung.obs.persistence.PersistedSettings
@@ -76,6 +77,7 @@ import io.panggung.obs.ui.layouts.ResponsiveStudioScaffold
 import io.panggung.obs.ui.layouts.StudioCallbacks
 import io.panggung.obs.ui.modals.ConfirmStopBroadcastDialog
 import io.panggung.obs.ui.modals.CrashRecoveryBanner
+import io.panggung.obs.ui.modals.ProCameraDialog
 import io.panggung.obs.ui.modals.RemoteQrDialog
 import io.panggung.obs.ui.modals.SourceContextMenuDialog
 import io.panggung.obs.ui.modals.ThermalGovernorBanner
@@ -138,6 +140,9 @@ class MainActivity : ComponentActivity() {
     private var lastNetGen by mutableStateOf(0L)
 
     private lateinit var cameraCapture: Camera2Capture
+    private lateinit var dualCameraCapture: Camera2Capture
+    private var dualCamActive by mutableStateOf(false)
+    private var showProCameraDialog by mutableStateOf(false)
     private lateinit var webViewCapture: WebViewCapture
     private val micCapture = AudioInputCapture()
     private var projector: ProjectorPresentation? = null
@@ -190,7 +195,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        cameraCapture = Camera2Capture(this)
+        cameraCapture = Camera2Capture(this, "Primary")
+        dualCameraCapture = Camera2Capture(this, "SecondaryPiP")
         webViewCapture = WebViewCapture(this)
         activeCameraToggle = { front ->
             runOnUiThread { addCamera(front, pipIfScreenActive = true) }
@@ -781,6 +787,20 @@ class MainActivity : ComponentActivity() {
             if (transformTargetSource != null) {
                 TransformDialog(sourceName = transformTargetSource!!, onDismiss = { transformTargetSource = null; transformVersion++ })
             }
+            if (showProCameraDialog) {
+                val lenses = remember { Camera2Capture.enumerateLenses(this@MainActivity) }
+                ProCameraDialog(
+                    lenses = lenses,
+                    activeCameraId = cameraCapture.currentCameraId,
+                    dualCamActive = dualCamActive,
+                    capabilities = cameraCapture.capabilities,
+                    initialState = cameraCapture.proState,
+                    onSelectLens = { lens -> switchCameraLens(lens) },
+                    onToggleDualCam = { toggleConcurrentDualCamera() },
+                    onStateChange = { next -> cameraCapture.applyProControls(next) },
+                    onDismiss = { showProCameraDialog = false },
+                )
+            }
             if (audioAdvTargetSource != null) {
                 AdvancedAudioDialog(sourceName = audioAdvTargetSource!!, onDismiss = { audioAdvTargetSource = null })
             }
@@ -851,6 +871,11 @@ class MainActivity : ComponentActivity() {
             ) {
                 BroadcastButton("+ Cam Back", { addCamera(front = false) }, tone = BroadcastTone.Primary, compact = true)
                 BroadcastButton("+ Cam Front", { addCamera(front = true) }, tone = BroadcastTone.Primary, compact = true)
+                BroadcastButton(if (dualCamActive) "Dual ON" else "+ Dual Cam", { toggleConcurrentDualCamera() }, tone = if (dualCamActive) BroadcastTone.Live else BroadcastTone.ActiveOutline, compact = true)
+                BroadcastButton("Pro Cam", {
+                    if (!cameraCapture.isRunning()) addCamera(front = false)
+                    showProCameraDialog = true
+                }, tone = BroadcastTone.ActiveOutline, compact = true)
                 BroadcastButton("+ Screen", { requestScreenCapture() }, tone = BroadcastTone.ActiveOutline, compact = true)
                 BroadcastButton("+ Browser", { addBrowserOverlay() }, compact = true)
                 BroadcastButton("+ Image", { pendingMediaKind = "image_source"; mediaPickerLauncher.launch(arrayOf("image/*")) }, compact = true)
@@ -1492,7 +1517,7 @@ class MainActivity : ComponentActivity() {
             NativeBridge.nativeAddSource("android_camera", name, "")
             name
         }
-        val sensorDeg = cameraCapture.start(front = front, width = 1280, height = 720)
+        val sensorDeg = cameraCapture.start(front = front, width = 1280, height = 720, sourceName = sourceName)
         val rot = if (baseH > baseW) sensorDeg.toFloat() else 0f
         if (hasScreen && pipIfScreenActive) {
             // Preserve existing PiP position/size on Front <-> Back flip; only place default PiP if newly added
@@ -1506,7 +1531,69 @@ class MainActivity : ComponentActivity() {
                 NativeBridge.nativeSetSourceTransform(sourceName, baseW / 2f, baseH / 2f, 1f, 1f, rot)
             }
         }
-        statusBanner = "$name active (sensor ${sensorDeg}°)"
+        statusBanner = "$name active (AHB Zero-Copy, ${sensorDeg}°)"
+        refreshSnapshot()
+    }
+
+    private fun switchCameraLens(lens: CameraLensInfo) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissionsIfNeeded(); return
+        }
+        startFgs(ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+        val name = if (lens.isFront) "Front Camera" else "Back Camera"
+        if (snapshot.sources.none { it.name == name }) {
+            NativeBridge.nativeAddSource("android_camera", name, "")
+        }
+        val sensorDeg = cameraCapture.start(
+            front = lens.isFront,
+            width = 1280,
+            height = 720,
+            explicitCameraId = lens.cameraId,
+            sourceName = name,
+        )
+        NativeBridge.nativeFitSourceToScreen(name)
+        statusBanner = "Lens ${lens.label} (id=${lens.cameraId}, ${sensorDeg}°) active"
+        refreshSnapshot()
+    }
+
+    private fun toggleConcurrentDualCamera() {
+        if (dualCamActive) {
+            dualCameraCapture.stop()
+            dualCamActive = false
+            statusBanner = "Dual-Camera PiP stopped"
+            refreshSnapshot()
+            return
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissionsIfNeeded(); return
+        }
+        val pair = Camera2Capture.findConcurrentBackFrontPair(this)
+        if (pair == null) {
+            statusBanner = "Concurrent dual-camera not supported on this device"
+            return
+        }
+        startFgs(ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+        val baseW = snapshot.baseWidth.coerceAtLeast(1)
+        val baseH = snapshot.baseHeight.coerceAtLeast(1)
+        if (snapshot.sources.none { it.name == "Back Camera" }) {
+            NativeBridge.nativeAddSource("android_camera", "Back Camera", "")
+        }
+        if (snapshot.sources.none { it.name == "Front Camera" }) {
+            NativeBridge.nativeAddSource("android_camera", "Front Camera", "")
+        }
+        val backDeg = cameraCapture.start(
+            front = false, width = 1280, height = 720,
+            explicitCameraId = pair.first, sourceName = "Back Camera",
+        )
+        val frontDeg = dualCameraCapture.start(
+            front = true, width = 640, height = 480,
+            explicitCameraId = pair.second, sourceName = "Front Camera",
+        )
+        NativeBridge.nativeFitSourceToScreen("Back Camera")
+        val pipRot = if (baseH > baseW) frontDeg.toFloat() else 0f
+        NativeBridge.nativeSetSourceTransform("Front Camera", baseW * 0.78f, baseH * 0.74f, 0.30f, 0.30f, pipRot)
+        dualCamActive = true
+        statusBanner = "Concurrent Dual-Cam active (Back=${pair.first}/${backDeg}° + Front=${pair.second}/${frontDeg}° PiP)"
         refreshSnapshot()
     }
 
@@ -1689,6 +1776,7 @@ class MainActivity : ComponentActivity() {
         if (isFinishing) {
             stopService(Intent(this, FloatingBubbleService::class.java))
             cameraCapture.stop()
+            dualCameraCapture.stop()
             webViewCapture.stop()
             micCapture.stop()
             NativeBridge.nativeShutdown()

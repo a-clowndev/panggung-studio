@@ -431,9 +431,39 @@ unsafe extern "C" {
     pub fn gs_reset_blend_state();
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct obs_sceneitem_crop {
+    pub left: c_int,
+    pub top: c_int,
+    pub right: c_int,
+    pub bottom: c_int,
+}
+
+#[link(name = "obs")]
+unsafe extern "C" {
+    pub fn obs_sceneitem_set_crop(item: *mut obs_sceneitem_t, crop: *const obs_sceneitem_crop);
+    pub fn obs_sceneitem_get_crop(item: *const obs_sceneitem_t, crop: *mut obs_sceneitem_crop);
+    pub fn obs_source_get_width(source: *const obs_source_t) -> u32;
+    pub fn obs_source_get_height(source: *const obs_source_t) -> u32;
+}
+
 #[link(name = "obs-android-plugins")]
 unsafe extern "C" {
     pub fn panggung_register_android_plugins();
+    pub fn panggung_push_camera_ahb(
+        source_name: *const c_char,
+        ahb_ptr: *mut c_void,
+        width: u32,
+        height: u32,
+        timestamp_ns: u64,
+    ) -> bool;
+    pub fn panggung_push_screen_ahb(
+        ahb_ptr: *mut c_void,
+        width: u32,
+        height: u32,
+        timestamp_ns: u64,
+    ) -> bool;
     pub fn panggung_push_camera_i420(
         y: *const u8,
         u: *const u8,

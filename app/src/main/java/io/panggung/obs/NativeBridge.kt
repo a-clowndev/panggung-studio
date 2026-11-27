@@ -1,5 +1,6 @@
 package io.panggung.obs
 
+import android.hardware.HardwareBuffer
 import android.view.Surface
 import java.nio.ByteBuffer
 
@@ -25,6 +26,12 @@ object NativeBridge {
     external fun nativeResizeSurface(width: Int, height: Int)
     external fun nativeDetachSurface()
 
+    external fun nativePushCameraHardwareBuffer(
+        sourceName: String, hwBuf: HardwareBuffer, width: Int, height: Int, timestampNs: Long,
+    ): Boolean
+    external fun nativePushScreenHardwareBuffer(
+        hwBuf: HardwareBuffer, width: Int, height: Int, timestampNs: Long,
+    ): Boolean
     external fun nativePushCameraI420(
         yBuf: ByteBuffer, uBuf: ByteBuffer, vBuf: ByteBuffer,
         yStride: Int, uStride: Int, vStride: Int, width: Int, height: Int, timestampNs: Long,
@@ -44,6 +51,7 @@ object NativeBridge {
     external fun nativeAddSource(sourceId: String, name: String, settingsJson: String): Boolean
     external fun nativeSetSourceVisible(name: String, visible: Boolean)
     external fun nativeSetSourceTransform(name: String, x: Float, y: Float, scaleX: Float, scaleY: Float, rotDeg: Float)
+    external fun nativeSetSourceCrop(name: String, left: Int, top: Int, right: Int, bottom: Int): Boolean
     external fun nativeRemoveSource(name: String)
     external fun nativeSetSourceVolume(name: String, volume: Float)
     external fun nativeSetSourceMuted(name: String, muted: Boolean)
