@@ -914,7 +914,20 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeSaveSceneCollecti
     });
 
     match serde_json::to_string_pretty(&doc) {
-        Ok(s) => if std::fs::write(&path, s).is_ok() { JNI_TRUE } else { JNI_FALSE },
+        Ok(s) => {
+            // Atomic write: write to .tmp, fsync, then POSIX rename to prevent corruption on crash
+            let tmp_path = format!("{path}.tmp");
+            let ok = (|| -> std::io::Result<()> {
+                use std::io::Write;
+                let mut f = std::fs::File::create(&tmp_path)?;
+                f.write_all(s.as_bytes())?;
+                f.sync_all()?;
+                std::fs::rename(&tmp_path, &path)?;
+                Ok(())
+            })()
+            .is_ok();
+            if ok { JNI_TRUE } else { let _ = std::fs::remove_file(&tmp_path); JNI_FALSE }
+        }
         Err(_) => JNI_FALSE,
     }
 }
@@ -1414,6 +1427,35 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeLoadSceneCollecti
     let mut guard = STATE.lock().unwrap();
     let Some(state) = guard.as_mut() else { return JNI_FALSE; };
 
+    // Restore saved video resolution/FPS & encoder if present in v2 collection
+    if let (Some(w), Some(h), Some(f)) = (
+        val.get("base_width").and_then(|x| x.as_u64()),
+        val.get("base_height").and_then(|x| x.as_u64()),
+        val.get("fps").and_then(|x| x.as_u64()),
+    ) {
+        let (wu, hu, fu) = (w as u32, h as u32, f as u32);
+        if wu >= 320 && hu >= 320 && fu >= 15 && (wu != state.base_width || hu != state.base_height || fu != state.fps) {
+            if state.ctx.reset_video(wu, hu, fu, 1).is_ok() {
+                state.base_width = wu;
+                state.base_height = hu;
+                state.fps = fu;
+            }
+        }
+    }
+    if let Some(enc) = val.get("video_encoder_id").and_then(|x| x.as_str()) {
+        if !enc.is_empty() {
+            state.video_encoder_id = enc.to_string();
+        }
+    }
+    if let Some(tid) = val.get("transition_id").and_then(|x| x.as_str()) {
+        if !tid.is_empty() {
+            state.transition_id = tid.to_string();
+        }
+    }
+    if let Some(tms) = val.get("transition_ms").and_then(|x| x.as_u64()) {
+        state.transition_ms = tms as u32;
+    }
+
     let bw = state.base_width;
     let bh = state.base_height;
 
@@ -1500,6 +1542,16 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeLoadSceneCollecti
 
                         let src = sys::obs_sceneitem_get_source(item);
                         if !src.is_null() {
+                            // Always apply saved source settings even when source already existed
+                            if !settings_str.is_empty() && settings_str != "{}" {
+                                if let Ok(cj) = CString::new(settings_str.as_str()) {
+                                    let sd = sys::obs_data_create_from_json(cj.as_ptr());
+                                    if !sd.is_null() {
+                                        sys::obs_source_update(src, sd);
+                                        sys::obs_data_release(sd);
+                                    }
+                                }
+                            }
                             if let Some(vol) = it.get("volume").and_then(|x| x.as_f64()) {
                                 sys::obs_source_set_volume(src, vol as f32);
                             }
@@ -1529,6 +1581,15 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeLoadSceneCollecti
                                     if let (Ok(cfid), Ok(cfn)) = (CString::new(fid), CString::new(fname)) {
                                         let existing_flt = sys::obs_source_get_filter_by_name(src, cfn.as_ptr());
                                         if !existing_flt.is_null() {
+                                            if !fset.is_empty() && fset != "{}" {
+                                                if let Ok(cj) = CString::new(fset.as_str()) {
+                                                    let fd = sys::obs_data_create_from_json(cj.as_ptr());
+                                                    if !fd.is_null() {
+                                                        sys::obs_source_update(existing_flt, fd);
+                                                        sys::obs_data_release(fd);
+                                                    }
+                                                }
+                                            }
                                             sys::obs_source_set_enabled(existing_flt, fenabled);
                                             sys::obs_source_release(existing_flt);
                                         } else {

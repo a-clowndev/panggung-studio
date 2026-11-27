@@ -69,8 +69,26 @@ object ThermalGovernor {
         }
     }
 
+    private fun parseSemVer(raw: String): Triple<Int, Int, Int> {
+        val clean = raw.trim().removePrefix("v").removePrefix("V").substringBefore("-")
+        val parts = clean.split(".")
+        return Triple(
+            parts.getOrNull(0)?.toIntOrNull() ?: 0,
+            parts.getOrNull(1)?.toIntOrNull() ?: 0,
+            parts.getOrNull(2)?.toIntOrNull() ?: 0,
+        )
+    }
+
+    internal fun isNewerVersion(remoteTag: String, currentVersion: String): Boolean {
+        val (rMaj, rMin, rPat) = parseSemVer(remoteTag)
+        val (cMaj, cMin, cPat) = parseSemVer(currentVersion)
+        if (rMaj != cMaj) return rMaj > cMaj
+        if (rMin != cMin) return rMin > cMin
+        return rPat > cPat
+    }
+
     /**
-     * In-App GitHub Releases Update Checker (T-E01).
+     * In-App GitHub Releases Update Checker with proper SemVer comparison.
      */
     suspend fun checkLatestRelease(currentVersion: String): String = withContext(Dispatchers.IO) {
         try {
@@ -82,7 +100,7 @@ object ThermalGovernor {
             if (conn.responseCode == 200) {
                 val body = conn.inputStream.bufferedReader().use { it.readText() }
                 val tag = JSONObject(body).optString("tag_name", currentVersion)
-                if (tag != currentVersion && tag != "v$currentVersion") {
+                if (isNewerVersion(tag, currentVersion)) {
                     "Update available: $tag (current v$currentVersion)"
                 } else {
                     "Up to date (v$currentVersion)"

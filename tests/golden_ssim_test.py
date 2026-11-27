@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
 Golden Render SSIM Verification (QA-02): captures live Panggung Studio preview via ADB screencap,
-verifies non-black luminance via ffmpeg signalstats, and computes real SSIM against a golden
-reference frame (passing if SSIM >= 0.85, or recording baseline if no reference exists yet).
+crops strictly to the preview canvas region (preventing bright UI chrome from masking a black preview),
+verifies non-black luminance via ffmpeg signalstats, and computes real SSIM against a golden reference.
 """
 import os
 import re
 import subprocess
 import sys
 
-GOLDEN_REF = os.environ.get("PANGGUNG_GOLDEN_REF", "/tmp/panggung_golden_ref.png")
-CAPTURE_PATH = "/tmp/panggung_golden_check.png"
+GOLDEN_REF = os.environ.get("PANGGUNG_GOLDEN_REF", "/tmp/panggung_golden_ref_crop.png")
+CAPTURE_RAW = "/tmp/panggung_golden_raw.png"
+CAPTURE_CROP = "/tmp/panggung_golden_crop.png"
+# Default crop targets the preview canvas area (override via PANGGUNG_CROP=w:h:x:y)
+PREVIEW_CROP = os.environ.get("PANGGUNG_CROP", "iw*0.60:ih*0.42:iw*0.20:ih*0.06")
 MIN_SSIM = float(os.environ.get("PANGGUNG_MIN_SSIM", "0.85"))
 
 
@@ -19,12 +22,21 @@ def run():
     if len(out) < 10_000 or not out.startswith(b"\x89PNG"):
         print("[FAIL] Invalid PNG screencap")
         return False
-    with open(CAPTURE_PATH, "wb") as f:
+    with open(CAPTURE_RAW, "wb") as f:
         f.write(out)
 
-    # 1. Verify non-black / non-corrupt luminance using signalstats metadata
+    # 1. Crop strictly to the preview canvas region
+    crop_proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", CAPTURE_RAW, "-vf", f"crop={PREVIEW_CROP}", CAPTURE_CROP],
+        capture_output=True, text=True,
+    )
+    if crop_proc.returncode != 0 or not os.path.exists(CAPTURE_CROP):
+        print(f"[FAIL] Preview crop failed: {crop_proc.stderr}")
+        return False
+
+    # 2. Verify non-black luminance ONLY on the cropped preview canvas
     stat_proc = subprocess.run(
-        ["ffmpeg", "-v", "info", "-i", CAPTURE_PATH, "-vf", "signalstats,metadata=print:file=-", "-f", "null", "-"],
+        ["ffmpeg", "-v", "info", "-i", CAPTURE_CROP, "-vf", "signalstats,metadata=print:file=-", "-f", "null", "-"],
         capture_output=True, text=True,
     )
     m_avg = re.search(r"lavfi\.signalstats\.YAVG=([0-9.]+)", stat_proc.stdout)
@@ -32,24 +44,24 @@ def run():
     yavg = float(m_avg.group(1)) if m_avg else 0.0
     ymax = float(m_max.group(1)) if m_max else 0.0
     if stat_proc.returncode != 0 or yavg < 5.0 or ymax < 20.0:
-        print(f"[FAIL] Black/corrupt frame detected (YAVG={yavg:.2f}, YMAX={ymax:.2f})")
+        print(f"[FAIL] Black/corrupt preview canvas detected (YAVG={yavg:.2f}, YMAX={ymax:.2f})")
         return False
 
-    # 2. Compute real SSIM against golden reference frame
+    # 3. Compute real SSIM on cropped preview against golden reference
     if not os.path.exists(GOLDEN_REF):
-        with open(GOLDEN_REF, "wb") as f:
-            f.write(out)
-        print(f"[PASS] Saved initial golden reference ({len(out)} bytes, YAVG={yavg:.1f}, YMAX={ymax:.1f})")
+        with open(CAPTURE_CROP, "rb") as src, open(GOLDEN_REF, "wb") as dst:
+            dst.write(src.read())
+        print(f"[PASS] Saved initial cropped golden reference (crop={PREVIEW_CROP}, YAVG={yavg:.1f}, YMAX={ymax:.1f})")
         return True
 
     ssim_proc = subprocess.run(
-        ["ffmpeg", "-i", CAPTURE_PATH, "-i", GOLDEN_REF, "-lavfi", "ssim", "-f", "null", "-"],
+        ["ffmpeg", "-i", CAPTURE_CROP, "-i", GOLDEN_REF, "-lavfi", "ssim", "-f", "null", "-"],
         capture_output=True, text=True,
     )
     m_ssim = re.search(r"All:([0-9.]+)", ssim_proc.stderr)
     ssim_val = float(m_ssim.group(1)) if m_ssim else 0.0
     ok = ssim_proc.returncode == 0 and ssim_val >= MIN_SSIM
-    print(f"[{'PASS' if ok else 'FAIL'}] Golden SSIM={ssim_val:.4f} (min={MIN_SSIM}, YAVG={yavg:.1f}, YMAX={ymax:.1f})")
+    print(f"[{'PASS' if ok else 'FAIL'}] Cropped Preview SSIM={ssim_val:.4f} (min={MIN_SSIM}, YAVG={yavg:.1f}, YMAX={ymax:.1f})")
     return ok
 
 

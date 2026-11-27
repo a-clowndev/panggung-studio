@@ -187,7 +187,7 @@ private fun PhonePortraitLayout(
                         .border(1.dp, PanggungColors.TealPrimary, PanggungRadius.Badge)
                         .padding(horizontal = 5.dp, vertical = 1.dp),
                 ) {
-                    Text("STUDIO v0.1.0", color = PanggungColors.TealActive, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
+                    Text("STUDIO v0.1.2", color = PanggungColors.TealActive, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
                 }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -622,7 +622,7 @@ private fun PhoneLandscape3ColLayout(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text("PANGGUNG STUDIO v0.1.0 • $statusBanner", color = PanggungColors.TextSecondary, fontSize = 9.sp, fontFamily = FontFamily.Monospace, maxLines = 1, modifier = Modifier.weight(1f))
+            Text("PANGGUNG STUDIO v0.1.2 • $statusBanner", color = PanggungColors.TextSecondary, fontSize = 9.sp, fontFamily = FontFamily.Monospace, maxLines = 1, modifier = Modifier.weight(1f))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = "[QR]",
@@ -871,7 +871,7 @@ private fun TabletFullSidebarLayout(
                 .padding(horizontal = 10.dp, vertical = 4.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
-            Text("PANGGUNG STUDIO v0.1.0 • $statusBanner", color = PanggungColors.TextSecondary, fontSize = 10.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f))
+            Text("PANGGUNG STUDIO v0.1.2 • $statusBanner", color = PanggungColors.TextSecondary, fontSize = 10.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f))
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = "[${if (orientationLock == "LANDSCAPE") "LAND" else if (orientationLock == "PORTRAIT") "PORT" else "AUTO"}]",

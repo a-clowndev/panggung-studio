@@ -488,7 +488,8 @@ class MainActivity : ComponentActivity() {
                             },
                             onCheckUpdates = {
                                 coroutineScope.launch {
-                                    statusBanner = ThermalGovernor.checkLatestRelease("0.1.0")
+                                    val curVer = try { packageManager.getPackageInfo(packageName, 0).versionName ?: "0.1.2" } catch (_: Exception) { "0.1.2" }
+                                    statusBanner = ThermalGovernor.checkLatestRelease(curVer)
                                 }
                             },
                             onToggleDualCanvas = {
@@ -651,7 +652,8 @@ class MainActivity : ComponentActivity() {
                                         ThermalGovernor.setKeepScreenOn(this@MainActivity, enabled)
                                     },
                                     onCheckUpdates = {
-                                        coroutineScope.launch { statusBanner = ThermalGovernor.checkLatestRelease("0.1.0") }
+                                        val curVer = try { packageManager.getPackageInfo(packageName, 0).versionName ?: "0.1.2" } catch (_: Exception) { "0.1.2" }
+                                        coroutineScope.launch { statusBanner = ThermalGovernor.checkLatestRelease(curVer) }
                                     },
                                     onToggleDualCanvas = {
                                         dualCanvasOn = !dualCanvasOn
@@ -753,7 +755,7 @@ class MainActivity : ComponentActivity() {
             if (showLogs) {
                 LogViewerDialog(
                     crashLog = NativeBridge.nativeGetLastCrashLog(),
-                    statusLog = "Panggung Engine v0.1.0 | ${snapshot.baseWidth}x${snapshot.baseHeight} | FPS=${snapshot.fps}\n$statusBanner",
+                    statusLog = "Panggung Engine v0.1.2 | ${snapshot.baseWidth}x${snapshot.baseHeight} | FPS=${snapshot.fps}\n$statusBanner",
                     onDismiss = { showLogs = false },
                 )
             }

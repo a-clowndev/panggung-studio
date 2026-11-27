@@ -86,7 +86,7 @@ pub fn start_obs_websocket_server(port: u16, lan_access: bool, auth_token: &str)
                     Ok((stream, _peer)) => {
                         let _ = stream.set_nonblocking(false);
                         let tok = expected_token.clone();
-                        thread::spawn(move || handle_client(stream, &tok));
+                        thread::spawn(move || handle_client(stream, &tok, generation));
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(80));
@@ -102,8 +102,13 @@ pub fn start_obs_websocket_server(port: u16, lan_access: bool, auth_token: &str)
         .is_ok()
 }
 
-fn handle_client(stream: std::net::TcpStream, password: &str) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
+fn is_session_valid(expected_gen: u64) -> bool {
+    WS_RUNNING.load(Ordering::SeqCst) && WS_GENERATION.load(Ordering::SeqCst) == expected_gen
+}
+
+fn handle_client(stream: std::net::TcpStream, password: &str, expected_gen: u64) {
+    // Short read timeout so active sessions promptly detect server disable or token rotation
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
     let mut ws = match accept(stream) {
         Ok(w) => w,
         Err(e) => {
@@ -112,8 +117,14 @@ fn handle_client(stream: std::net::TcpStream, password: &str) {
         }
     };
 
-    let challenge = random_b64(24);
-    let salt = random_b64(24);
+    let (Some(challenge), Some(salt)) = (random_b64(24), random_b64(24)) else {
+        error!("CSPRNG (/dev/urandom) unavailable — failing closed");
+        let _ = ws.close(Some(CloseFrame {
+            code: CloseCode::Error,
+            reason: "CSPRNG unavailable".into(),
+        }));
+        return;
+    };
     let expected_auth = compute_obs_ws_auth(password, &salt, &challenge);
 
     // OpCode 0: Hello (obs-websocket v5.5.0 with mandatory authentication)
@@ -135,7 +146,31 @@ fn handle_client(stream: std::net::TcpStream, password: &str) {
 
     let mut identified = false;
 
-    while let Ok(msg) = ws.read() {
+    loop {
+        if !is_session_valid(expected_gen) {
+            info!("Closing active obs-websocket session (server stopped or token rotated)");
+            let _ = ws.close(Some(CloseFrame {
+                code: CloseCode::Away,
+                reason: "Server stopped or token rotated".into(),
+            }));
+            return;
+        }
+        let msg = match ws.read() {
+            Ok(m) => m,
+            Err(tungstenite::Error::Io(ref e))
+                if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => return,
+        };
+        if !is_session_valid(expected_gen) {
+            let _ = ws.close(Some(CloseFrame {
+                code: CloseCode::Away,
+                reason: "Server stopped or token rotated".into(),
+            }));
+            return;
+        }
         let Message::Text(txt) = msg else { continue };
         let Ok(v) = serde_json::from_str::<Value>(&txt) else { continue };
         let op = v.get("op").and_then(|x| x.as_u64()).unwrap_or(999);
@@ -376,8 +411,8 @@ fn dispatch_request(req_type: &str, data: &Value) -> (bool, Value) {
         "RemuxRecording" => {
             let src = data.get("srcPath").and_then(|x| x.as_str()).unwrap_or("");
             let dst = data.get("dstPath").and_then(|x| x.as_str()).unwrap_or("");
-            if src.contains("..") || dst.contains("..") {
-                return (false, json!({ "error": "Invalid path" }));
+            if !is_allowed_recording_path(src, true) || !is_allowed_recording_path(dst, false) {
+                return (false, json!({ "error": "Path outside allowed recording directory" }));
             }
             (ws_remux_to_mp4(src, dst), json!({}))
         }
@@ -552,20 +587,42 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-pub fn random_b64(num_bytes: usize) -> String {
-    let mut buf = vec![0u8; num_bytes];
-    if let Ok(mut f) = File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut buf);
-    } else {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(1);
-        for (i, b) in buf.iter_mut().enumerate() {
-            *b = ((nanos >> ((i % 16) * 8)) ^ (i as u128 * 37)) as u8;
-        }
+/// Canonical allowlist check for recording paths (prevents arbitrary filesystem access/remux).
+pub fn is_allowed_recording_path(path: &str, must_exist: bool) -> bool {
+    if path.is_empty() || path.contains("..") || path.contains('\0') {
+        return false;
     }
-    base64_encode(&buf)
+    let p = std::path::Path::new(path);
+    let canonical = if must_exist {
+        match std::fs::canonicalize(p) {
+            Ok(c) => c,
+            Err(_) => return false,
+        }
+    } else {
+        let Some(parent) = p.parent() else { return false; };
+        let Some(fname) = p.file_name() else { return false; };
+        match std::fs::canonicalize(parent) {
+            Ok(cp) => cp.join(fname),
+            Err(_) => return false,
+        }
+    };
+    let s = canonical.to_string_lossy();
+    const ALLOWED_PREFIXES: &[&str] = &[
+        "/storage/emulated/0/Android/data/io.panggung.obs/",
+        "/sdcard/Android/data/io.panggung.obs/",
+        "/storage/emulated/0/Movies/Panggung",
+        "/data/user/0/io.panggung.obs/",
+        "/data/data/io.panggung.obs/",
+    ];
+    ALLOWED_PREFIXES.iter().any(|pref| s.starts_with(pref))
+}
+
+/// Fail-closed CSPRNG reading strictly from OS `/dev/urandom` (never falls back to weak timestamps).
+pub fn random_b64(num_bytes: usize) -> Option<String> {
+    let mut buf = vec![0u8; num_bytes];
+    let mut f = File::open("/dev/urandom").ok()?;
+    f.read_exact(&mut buf).ok()?;
+    Some(base64_encode(&buf))
 }
 
 pub fn sha256(data: &[u8]) -> [u8; 32] {

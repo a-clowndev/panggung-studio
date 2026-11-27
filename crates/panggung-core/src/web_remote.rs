@@ -30,7 +30,7 @@ const UNAUTHORIZED_HTML: &str = r#"<!DOCTYPE html>
   <div class="box">
     <h1>Panggung Studio Remote</h1>
     <p>Enter the session token shown in Panggung Studio &rarr; Remote Control.</p>
-    <form method="GET" action="/">
+    <form method="POST" action="/auth">
       <input type="password" name="token" placeholder="Session Token" required autofocus/>
       <button type="submit">Unlock Remote</button>
     </form>
@@ -79,8 +79,7 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
     <div id="mixer"></div>
   </div>
 <script>
-const params = new URLSearchParams(location.search);
-const TOKEN = params.get('token') || '';
+const TOKEN = "__PANGGUNG_SESSION_TOKEN__";
 const wsUrl = `ws://${location.hostname}:4455`;
 let ws, rid = 0, recActive = false, identified = false;
 
@@ -223,21 +222,30 @@ pub fn stop_web_remote_server() {
 }
 
 fn extract_http_token(req: &str) -> Option<String> {
-    // 1. Check Authorization: Bearer <token>
+    // 1. Authorization: Bearer <token>
     for line in req.lines() {
         let lower = line.to_ascii_lowercase();
         if lower.starts_with("authorization: bearer ") {
             return Some(line[22..].trim().to_string());
         }
+        // 2. HttpOnly Cookie: panggung_token=<token>
+        if lower.starts_with("cookie:") {
+            for part in line[7..].split(';') {
+                if let Some((k, v)) = part.trim().split_once('=') {
+                    if k == "panggung_token" {
+                        return Some(v.trim().to_string());
+                    }
+                }
+            }
+        }
     }
-    // 2. Check GET /?token=<token> HTTP/1.1
-    let first = req.lines().next()?;
-    let path = first.split_whitespace().nth(1)?;
-    let query = path.split_once('?')?.1;
-    for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if k == "token" {
-                return Some(v.to_string());
+    // 3. POST /auth form body: token=<token>
+    if let Some((_, body)) = req.split_once("\r\n\r\n") {
+        for pair in body.trim().split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                if k == "token" {
+                    return Some(v.trim().to_string());
+                }
             }
         }
     }
@@ -279,18 +287,28 @@ pub fn start_web_remote_server(port: u16, lan_access: bool, auth_token: &str) ->
                         let mut buf = [0u8; 2048];
                         let n = stream.read(&mut buf).unwrap_or(0);
                         let req = String::from_utf8_lossy(&buf[..n]);
+                        let is_post_auth = req.starts_with("POST /auth");
                         let provided = extract_http_token(&req).unwrap_or_default();
                         let ok = constant_time_eq(provided.as_bytes(), expected.as_bytes());
-                        let (status, body) = if ok {
-                            ("200 OK", REMOTE_HTML)
+                        let resp = if is_post_auth && ok {
+                            format!(
+                                "HTTP/1.1 303 See Other\r\nLocation: /\r\nSet-Cookie: panggung_token={}; HttpOnly; SameSite=Strict; Path=/\r\nCache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                expected
+                            )
+                        } else if ok {
+                            let body = REMOTE_HTML.replace("__PANGGUNG_SESSION_TOKEN__", &expected);
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            )
                         } else {
-                            ("401 Unauthorized", UNAUTHORIZED_HTML)
+                            format!(
+                                "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                UNAUTHORIZED_HTML.len(),
+                                UNAUTHORIZED_HTML
+                            )
                         };
-                        let resp = format!(
-                            "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            body.len(),
-                            body
-                        );
                         let _ = stream.write_all(resp.as_bytes());
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {

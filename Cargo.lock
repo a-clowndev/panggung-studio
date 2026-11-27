@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "obs"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "log",
  "obs-sys",
@@ -358,14 +358,14 @@ dependencies = [
 
 [[package]]
 name = "obs-sys"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "panggung-core"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "android_logger",
  "jni",

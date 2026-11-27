@@ -11,6 +11,8 @@ Tests:
   7. Portrait <-> 3-Col Landscape Orientation Torture + Zero Crash/ANR Logcat Audit
 """
 import asyncio
+import base64
+import hashlib
 import json
 import os
 import re
@@ -23,6 +25,12 @@ import websockets
 from tests.ui_tap_e2e_test import adb, tap_text, check_no_neon_green_line, screencap
 
 WS_URL = "ws://127.0.0.1:4455"
+AUTH_TOKEN = os.environ.get("PANGGUNG_TOKEN", "")
+
+
+def compute_obs_ws_auth(password: str, salt: str, challenge: str) -> str:
+    sec = base64.b64encode(hashlib.sha256((password + salt).encode()).digest()).decode()
+    return base64.b64encode(hashlib.sha256((sec + challenge).encode()).digest()).decode()
 req_counter = 0
 results = []
 
@@ -96,9 +104,14 @@ async def run_stress():
     record("Stage 1: 6x Rapid Camera Back<->Front Thrash + Zero Green Line", cam_ok and no_green, g_det)
 
     async with websockets.connect(WS_URL, max_size=4 * 1024 * 1024) as ws:
-        await ws.recv()
-        await ws.send(json.dumps({"op": 1, "d": {"rpcVersion": 1}}))
-        await ws.recv()
+        hello = json.loads(await ws.recv())
+        a = hello["d"]["authentication"]
+        if not AUTH_TOKEN:
+            raise RuntimeError("Set PANGGUNG_TOKEN=<16-char session token from Remote Control dialog>")
+        auth = compute_obs_ws_auth(AUTH_TOKEN, a["salt"], a["challenge"])
+        await ws.send(json.dumps({"op": 1, "d": {"rpcVersion": 1, "authentication": auth}}))
+        ident = json.loads(await ws.recv())
+        assert ident.get("op") == 2, f"Auth failed: {ident}"
 
         # STAGE 2: Heavy 1080p60 Multi-Source (8 sources) + Multi-Filter (5 filters) Stack
         ok_1080, _, _ = await ws_req(ws, "SetVideoSettingsEx", {
@@ -169,7 +182,8 @@ async def run_stress():
         http_ok = 0
         for _ in range(20):
             try:
-                with urllib.request.urlopen("http://127.0.0.1:8080/", timeout=3) as r:
+                req_http = urllib.request.Request("http://127.0.0.1:8080/", headers={"Authorization": f"Bearer {AUTH_TOKEN}"})
+                with urllib.request.urlopen(req_http, timeout=3) as r:
                     if r.status == 200 and len(r.read()) > 1000:
                         http_ok += 1
             except Exception:

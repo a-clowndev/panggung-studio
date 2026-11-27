@@ -14,10 +14,14 @@ Tests:
  10. Replay Buffer: StartReplayBuffer -> SaveReplayBuffer -> StopReplayBuffer
 """
 import asyncio
+import base64
+import hashlib
 import json
 import os
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 
 try:
     import websockets
@@ -27,7 +31,13 @@ except ImportError:
 
 
 WS_URL = "ws://127.0.0.1:4455"
+AUTH_TOKEN = os.environ.get("PANGGUNG_TOKEN", "")
 REQ_ID = 0
+
+
+def compute_obs_ws_auth(password: str, salt: str, challenge: str) -> str:
+    sec = base64.b64encode(hashlib.sha256((password + salt).encode()).digest()).decode()
+    return base64.b64encode(hashlib.sha256((sec + challenge).encode()).digest()).decode()
 
 
 def adb(*args, check=True):
@@ -88,10 +98,14 @@ async def run_all():
 
     async with websockets.connect(WS_URL, open_timeout=10) as ws:
         hello = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
-        record("WS Hello (op=0)", hello.get("op") == 0, f"v={hello.get('d', {}).get('obsWebSocketVersion')}")
-        await ws.send(json.dumps({"op": 1, "d": {"rpcVersion": 1}}))
+        auth_obj = hello.get("d", {}).get("authentication", {})
+        record("WS Hello (op=0 + SHA-256 auth challenge)", hello.get("op") == 0 and "challenge" in auth_obj and "salt" in auth_obj, f"v={hello.get('d', {}).get('obsWebSocketVersion')}")
+        if not AUTH_TOKEN:
+            raise RuntimeError("Set PANGGUNG_TOKEN=<16-char session token from Remote Control dialog> before running E2E")
+        auth_str = compute_obs_ws_auth(AUTH_TOKEN, auth_obj["salt"], auth_obj["challenge"])
+        await ws.send(json.dumps({"op": 1, "d": {"rpcVersion": 1, "authentication": auth_str}}))
         ident = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
-        record("WS Identified (op=2)", ident.get("op") == 2)
+        record("WS Identified (op=2 SHA-256 verified)", ident.get("op") == 2)
 
         ok, _, data = await ws_req(ws, "GetVersion")
         record("GetVersion", ok and "obsVersion" in data, f"obs={data.get('obsVersion')}")
@@ -208,29 +222,24 @@ async def run_all():
             end
         """
         ok_lua, _, ldata = await ws_req(ws, "RunLuaScript", {"label": "e2e_test.lua", "code": lua_code})
-        ok_ll, _, llist = await ws_req(ws, "GetScriptList")
-        record("Embedded Lua 5.4 (obslua) Script", ok_lua and ok_ll and len(llist.get("scripts", [])) >= 1, f"desc={ldata.get('description')}")
+        ok_ll, _, _ = await ws_req(ws, "GetScriptList")
+        record("Security: Remote RunLuaScript blocked + GetScriptList read-only", (not ok_lua) and ok_ll, f"resp={ldata}")
 
-        # Dynamic Third-Party .pgplugin Custom GLSL ES Shader Filter E2E
-        lib_dir = adb("shell", "dumpsys package io.panggung.obs | grep legacyNativeLibraryDir | head -1").stdout.strip().split("=", 1)[-1]
-        plugin_so = f"{lib_dir}/arm64/libobs-mod-panggung-shader.so"
-        ok_plg, _, _ = await ws_req(ws, "LoadPluginSo", {"soPath": plugin_so, "dataPath": ""})
-        ok_pf1, _, _ = await ws_req(ws, "CreateSourceFilter", {
-            "sourceName": "Background",
-            "filterName": "Custom GLSL Shader",
-            "filterKind": "panggung_custom_shader_filter",
-        })
-        ok_pf2, _, pf_list = await ws_req(ws, "GetSourceFilterList", {"sourceName": "Background"})
-        pf_names = [f.get("filterName") for f in pf_list.get("filters", [])]
-        ok_pf3, _, _ = await ws_req(ws, "RemoveSourceFilter", {"sourceName": "Background", "filterName": "Custom GLSL Shader"})
-        record("Dynamic .pgplugin Custom GLSL ES Shader Filter", ok_plg and ok_pf1 and ("Custom GLSL Shader" in pf_names) and ok_pf3, f"so={os.path.basename(plugin_so)}")
+        # Security: Remote LoadPluginSo MUST be blocked over network API
+        ok_plg, _, pdata = await ws_req(ws, "LoadPluginSo", {"soPath": "/data/local/tmp/untrusted.so", "dataPath": ""})
+        record("Security: Remote LoadPluginSo blocked", not ok_plg, f"resp={pdata}")
 
-        # Built-in Web Remote UI HTTP E2E (:8080)
+        # Built-in Web Remote UI HTTP E2E (:8080) — 401 without auth, 200 with Bearer token
         adb("forward", "tcp:8080", "tcp:8080")
-        import urllib.request
-        with urllib.request.urlopen("http://127.0.0.1:8080/", timeout=5) as resp:
+        unauth_401 = False
+        try:
+            urllib.request.urlopen("http://127.0.0.1:8080/", timeout=5)
+        except urllib.error.HTTPError as e:
+            unauth_401 = (e.code == 401)
+        req_auth = urllib.request.Request("http://127.0.0.1:8080/", headers={"Authorization": f"Bearer {AUTH_TOKEN}"})
+        with urllib.request.urlopen(req_auth, timeout=5) as resp:
             html = resp.read().decode("utf-8", errors="ignore")
-            record("Built-in Web Remote UI (:8080)", resp.status == 200 and "Panggung Web Remote" in html, f"bytes={len(html)}")
+            record("Built-in Web Remote UI (:8080 401 unauth / 200 Bearer)", unauth_401 and resp.status == 200 and "Panggung Web Remote" in html, f"bytes={len(html)}")
 
         # Native 3P Plugin Pack E2E (all 9 filters + Gradient source)
         for fid in [
@@ -340,14 +349,17 @@ async def run_all():
             if os.path.exists(local_hdr) and os.path.getsize(local_hdr) > 4096:
                 pr = subprocess.run(
                     ["ffprobe", "-v", "error", "-select_streams", "v:0",
-                     "-show_entries", "stream=codec_name,width,height,color_primaries,color_transfer",
+                     "-show_entries", "stream=codec_name,width,height,pix_fmt,color_primaries,color_transfer",
                      "-of", "json", local_hdr],
                     capture_output=True, text=True,
                 )
                 try:
                     st_info = json.loads(pr.stdout)["streams"][0]
-                    hdr_ok = st_info.get("codec_name") == "hevc"
-                    hdr_detail = f"{st_info.get('codec_name')} {st_info.get('width')}x{st_info.get('height')} primaries={st_info.get('color_primaries')} trc={st_info.get('color_transfer')}"
+                    is_hevc = st_info.get("codec_name") == "hevc"
+                    is_10bit = st_info.get("pix_fmt") in ("yuv420p10le", "p010le", "yuv420p10be")
+                    is_hdr_trc = st_info.get("color_transfer") in ("smpte2084", "arib-std-b67")
+                    hdr_ok = is_hevc and is_10bit and is_hdr_trc
+                    hdr_detail = f"{st_info.get('codec_name')} {st_info.get('pix_fmt')} {st_info.get('width')}x{st_info.get('height')} primaries={st_info.get('color_primaries')} trc={st_info.get('color_transfer')}"
                 except Exception as e:
                     hdr_detail = f"ffprobe parse err: {e}"
         # Restore SDR NV12 Rec.709 + H.264
