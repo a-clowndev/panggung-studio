@@ -481,33 +481,31 @@ unsafe extern "C" {
 pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativePushCameraHardwareBuffer(
     mut env: JNIEnv, _class: JClass,
     source_name: JString, hw_buf: JObject,
-    width: jint, height: jint, timestamp_ns: jlong,
-) -> jboolean {
+    width: jint, height: jint, frame_seq: jlong,
+) -> jlong {
     let name: String = env.get_string(&source_name).map(|s| s.into()).unwrap_or_default();
-    let Ok(c_name) = CString::new(name) else { return JNI_FALSE; };
+    let Ok(c_name) = CString::new(name) else { return 0; };
     let ahb = unsafe { AHardwareBuffer_fromHardwareBuffer(env.get_raw(), hw_buf.as_raw()) };
     if ahb.is_null() {
-        return JNI_FALSE;
+        return 0;
     }
-    let ok = unsafe {
-        sys::panggung_push_camera_ahb(c_name.as_ptr(), ahb, width.max(0) as u32, height.max(0) as u32, timestamp_ns as u64)
-    };
-    if ok { JNI_TRUE } else { JNI_FALSE }
+    unsafe {
+        sys::panggung_push_camera_ahb(c_name.as_ptr(), ahb, width.max(0) as u32, height.max(0) as u32, frame_seq.max(0) as u64) as jlong
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativePushScreenHardwareBuffer(
     env: JNIEnv, _class: JClass,
-    hw_buf: JObject, width: jint, height: jint, timestamp_ns: jlong,
-) -> jboolean {
+    hw_buf: JObject, width: jint, height: jint, frame_seq: jlong,
+) -> jlong {
     let ahb = unsafe { AHardwareBuffer_fromHardwareBuffer(env.get_raw(), hw_buf.as_raw()) };
     if ahb.is_null() {
-        return JNI_FALSE;
+        return 0;
     }
-    let ok = unsafe {
-        sys::panggung_push_screen_ahb(ahb, width.max(0) as u32, height.max(0) as u32, timestamp_ns as u64)
-    };
-    if ok { JNI_TRUE } else { JNI_FALSE }
+    unsafe {
+        sys::panggung_push_screen_ahb(ahb, width.max(0) as u32, height.max(0) as u32, frame_seq.max(0) as u64) as jlong
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -867,9 +865,11 @@ fn save_scene_collection_locked(state: &AppState, path: &str) -> bool {
                 let mut pos = sys::vec2 { x: 0.0, y: 0.0 };
                 let mut scale = sys::vec2 { x: 1.0, y: 1.0 };
                 let mut bounds = sys::vec2 { x: 0.0, y: 0.0 };
+                let mut crop = sys::obs_sceneitem_crop::default();
                 sys::obs_sceneitem_get_pos(item, &mut pos);
                 sys::obs_sceneitem_get_scale(item, &mut scale);
                 sys::obs_sceneitem_get_bounds(item, &mut bounds);
+                sys::obs_sceneitem_get_crop(item, &mut crop);
                 let rot = sys::obs_sceneitem_get_rot(item);
                 let bounds_type = sys::obs_sceneitem_get_bounds_type(item);
                 let alignment = sys::obs_sceneitem_get_alignment(item);
@@ -940,6 +940,10 @@ fn save_scene_collection_locked(state: &AppState, path: &str) -> bool {
                     "bounds_y": bounds.y,
                     "alignment": alignment,
                     "bounds_alignment": bounds_alignment,
+                    "crop_left": crop.left,
+                    "crop_top": crop.top,
+                    "crop_right": crop.right,
+                    "crop_bottom": crop.bottom,
                     "volume": volume,
                     "muted": muted,
                     "sync_offset_ns": sync_offset,
@@ -991,7 +995,7 @@ fn save_scene_collection_locked(state: &AppState, path: &str) -> bool {
     }
 }
 
-fn auto_save_scene_collection_locked(state: &AppState) {
+pub(crate) fn auto_save_scene_collection_locked(state: &AppState) {
     if let Some(parent) = std::path::Path::new(&state.config_dir).parent() {
         let p = parent.join("scene_collection.json");
         if let Some(s) = p.to_str() {
@@ -1662,6 +1666,17 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeLoadSceneCollecti
                         }
                         if let Some(lck) = it.get("locked").and_then(|x| x.as_bool()) {
                             sys::obs_sceneitem_set_locked(item, lck);
+                        }
+                        if it.get("crop_left").is_some() || it.get("crop_top").is_some()
+                            || it.get("crop_right").is_some() || it.get("crop_bottom").is_some()
+                        {
+                            let crop = sys::obs_sceneitem_crop {
+                                left: it.get("crop_left").and_then(|x| x.as_i64()).unwrap_or(0).max(0) as libc::c_int,
+                                top: it.get("crop_top").and_then(|x| x.as_i64()).unwrap_or(0).max(0) as libc::c_int,
+                                right: it.get("crop_right").and_then(|x| x.as_i64()).unwrap_or(0).max(0) as libc::c_int,
+                                bottom: it.get("crop_bottom").and_then(|x| x.as_i64()).unwrap_or(0).max(0) as libc::c_int,
+                            };
+                            sys::obs_sceneitem_set_crop(item, &crop);
                         }
 
                         let src = sys::obs_sceneitem_get_source(item);

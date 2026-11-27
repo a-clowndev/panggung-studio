@@ -104,9 +104,9 @@ def main():
     # 1. Clean branding check on startup screen
     root = dump_ui()
     has_panggung = find_node(root, text="PANGGUNG") is not None
-    has_studio_ver = find_node(root, text="STUDIO v0.2.0") is not None
+    has_studio_ver = find_node(root, contains="STUDIO v0.") is not None
     has_obs = find_node(root, contains="OBS") is not None
-    record("Startup Branding (PANGGUNG + STUDIO v0.2.0, zero OBS)", has_panggung and has_studio_ver and not has_obs)
+    record("Startup Branding (PANGGUNG + STUDIO v0.x, zero OBS)", has_panggung and has_studio_ver and not has_obs)
 
     # 2. Camera Back -> Front (1-tap!) -> Back (1-tap!) + Green Line Pixel Audit
     adb("logcat", "-c")

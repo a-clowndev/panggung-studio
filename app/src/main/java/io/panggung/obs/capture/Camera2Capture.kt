@@ -6,6 +6,7 @@ import android.graphics.ImageFormat
 import android.hardware.HardwareBuffer
 import android.hardware.camera2.*
 import android.hardware.camera2.params.RggbChannelVector
+import android.media.Image
 import android.media.ImageReader
 import android.os.Build
 import android.os.Handler
@@ -14,6 +15,8 @@ import android.util.Log
 import android.util.Range
 import android.util.Size
 import io.panggung.obs.NativeBridge
+import java.nio.ByteBuffer
+import java.util.ArrayDeque
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
@@ -79,6 +82,12 @@ class Camera2Capture(
     private var session: CameraCaptureSession? = null
     private var reader: ImageReader? = null
     private var activeReqBuilder: CaptureRequest.Builder? = null
+    private val frameSeq = AtomicLong(0)
+    private val inFlightAhb = ArrayDeque<Triple<Long, Image, HardwareBuffer>>()
+    private var cpuYBuf: ByteBuffer? = null
+    private var cpuUBuf: ByteBuffer? = null
+    private var cpuVBuf: ByteBuffer? = null
+    private var cpuRowScratch = ByteArray(0)
 
     @Volatile var currentCameraId: String? = null; private set
     @Volatile var currentSourceName: String = "Back Camera"; private set
@@ -135,11 +144,11 @@ class Camera2Capture(
             return out
         }
 
-        /** Query hardware-supported concurrent Back+Front camera ID pair (Android 11+ / API 30+). */
+        /** Query hardware-supported concurrent Back+Front camera ID pair (strict on Android 11+ / API 30+). */
         fun findConcurrentBackFrontPair(context: Context): Pair<String, String>? {
             val mgr = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
             if (Build.VERSION.SDK_INT >= 30) {
-                try {
+                return try {
                     for (set in mgr.concurrentCameraIds) {
                         var back: String? = null
                         var front: String? = null
@@ -152,11 +161,14 @@ class Camera2Capture(
                             return back to front
                         }
                     }
+                    // Strict: on API 30+, if HAL reports no concurrent Back+Front pair, do NOT force an unsupported session
+                    null
                 } catch (e: Exception) {
                     Log.w("Camera2Capture", "concurrentCameraIds query failed: ${e.message}")
+                    null
                 }
             }
-            // Fallback best-effort pair ("0" back + "1" front)
+            // Legacy API 29 (before concurrentCameraIds existed)
             val back = mgr.cameraIdList.firstOrNull {
                 mgr.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
             }
@@ -298,6 +310,7 @@ class Camera2Capture(
         height: Int = 720,
         explicitCameraId: String? = null,
         sourceName: String? = null,
+        onSessionReady: ((Boolean) -> Unit)? = null,
     ): Int {
         val myGen = generation.incrementAndGet()
         val mgr = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -324,41 +337,70 @@ class Camera2Capture(
             closeCurrentLocked()
             if (myGen != generation.get()) return@post
 
-            // Zero-Copy GPU AHardwareBuffer ImageReader (ImageFormat.PRIVATE + USAGE_GPU_SAMPLED_IMAGE)
-            val ir = ImageReader.newInstance(
-                chosen.width,
-                chosen.height,
-                ImageFormat.PRIVATE,
-                3,
-                HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
-            )
+            // Zero-Copy GPU AHardwareBuffer ImageReader (with strict fallback to YUV_420_888 CPU path if unsupported)
+            var useAhb = true
+            val ir = try {
+                ImageReader.newInstance(
+                    chosen.width,
+                    chosen.height,
+                    ImageFormat.PRIVATE,
+                    4,
+                    HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
+                )
+            } catch (e: Exception) {
+                Log.w("Camera2Capture", "[$instanceTag] AHB ImageReader unsupported (${e.message}), falling back to YUV_420_888")
+                useAhb = false
+                ImageReader.newInstance(chosen.width, chosen.height, ImageFormat.YUV_420_888, 3)
+            }
             synchronized(lock) { reader = ir }
 
             val srcNameSnapshot = currentSourceName
-            ir.setOnImageAvailableListener({ r ->
-                val img = try { r.acquireLatestImage() } catch (_: Exception) { null } ?: return@setOnImageAvailableListener
-                try {
-                    if (myGen != generation.get()) return@setOnImageAvailableListener
-                    val hb = img.hardwareBuffer
-                    if (hb != null) {
-                        try {
-                            NativeBridge.nativePushCameraHardwareBuffer(
-                                srcNameSnapshot,
-                                hb,
-                                img.width,
-                                img.height,
-                                img.timestamp,
-                            )
-                        } finally {
-                            hb.close()
-                        }
+            if (useAhb) {
+                ir.setOnImageAvailableListener({ r ->
+                    // Release any previously in-flight images only if BufferQueue nears capacity (safety valve)
+                    while (inFlightAhb.size >= 3) {
+                        val oldest = inFlightAhb.removeFirst()
+                        try { oldest.third.close() } catch (_: Exception) {}
+                        try { oldest.second.close() } catch (_: Exception) {}
                     }
-                } catch (e: Exception) {
-                    Log.w("Camera2Capture", "[$instanceTag] AHB frame err: ${e.message}")
-                } finally {
-                    img.close()
-                }
-            }, camHandler)
+                    val img = try { r.acquireLatestImage() } catch (_: Exception) { null } ?: return@setOnImageAvailableListener
+                    if (myGen != generation.get()) {
+                        img.close()
+                        return@setOnImageAvailableListener
+                    }
+                    val hb = try { img.hardwareBuffer } catch (_: Exception) { null }
+                    if (hb == null) {
+                        img.close()
+                        return@setOnImageAvailableListener
+                    }
+                    val seq = frameSeq.incrementAndGet()
+                    inFlightAhb.addLast(Triple(seq, img, hb))
+                    val releasedSeq = try {
+                        NativeBridge.nativePushCameraHardwareBuffer(srcNameSnapshot, hb, img.width, img.height, seq)
+                    } catch (e: Exception) {
+                        Log.w("Camera2Capture", "[$instanceTag] AHB push err: ${e.message}")
+                        0L
+                    }
+                    // Close ONLY images whose GPU EGLSyncKHR fence has already completed!
+                    while (inFlightAhb.isNotEmpty() && inFlightAhb.first().first <= releasedSeq) {
+                        val done = inFlightAhb.removeFirst()
+                        try { done.third.close() } catch (_: Exception) {}
+                        try { done.second.close() } catch (_: Exception) {}
+                    }
+                }, camHandler)
+            } else {
+                ir.setOnImageAvailableListener({ r ->
+                    val img = try { r.acquireLatestImage() } catch (_: Exception) { null } ?: return@setOnImageAvailableListener
+                    try {
+                        if (myGen != generation.get()) return@setOnImageAvailableListener
+                        pushCpuI420Fallback(img)
+                    } catch (e: Exception) {
+                        Log.w("Camera2Capture", "[$instanceTag] CPU fallback err: ${e.message}")
+                    } finally {
+                        img.close()
+                    }
+                }, camHandler)
+            }
 
             val latch = CountDownLatch(1)
             synchronized(lock) { closeLatch = latch }
@@ -390,30 +432,36 @@ class Camera2Capture(
                                     try {
                                         s.setRepeatingRequest(req.build(), null, camHandler)
                                         Log.i("Camera2Capture", "Streaming camId=$camId (front=$facingFront, src='$srcNameSnapshot') AHB-ZeroCopy gen=$myGen")
+                                        onSessionReady?.invoke(true)
                                     } catch (e: Exception) {
                                         Log.e("Camera2Capture", "[$instanceTag] setRepeatingRequest failed", e)
+                                        onSessionReady?.invoke(false)
                                     }
                                 }
                                 override fun onConfigureFailed(s: CameraCaptureSession) {
                                     Log.e("Camera2Capture", "[$instanceTag] CaptureSession configure failed for camId=$camId")
+                                    onSessionReady?.invoke(false)
                                 }
                             }, camHandler)
                         } catch (e: Exception) {
                             Log.e("Camera2Capture", "[$instanceTag] createCaptureSession failed", e)
+                            onSessionReady?.invoke(false)
                         }
                     }
 
                     override fun onClosed(cam: CameraDevice) { latch.countDown() }
-                    override fun onDisconnected(cam: CameraDevice) { cam.close(); latch.countDown() }
+                    override fun onDisconnected(cam: CameraDevice) { cam.close(); latch.countDown(); onSessionReady?.invoke(false) }
                     override fun onError(cam: CameraDevice, error: Int) {
                         Log.e("Camera2Capture", "[$instanceTag] Camera error=$error camId=$camId gen=$myGen")
                         cam.close()
                         latch.countDown()
+                        onSessionReady?.invoke(false)
                     }
                 }, camHandler)
             } catch (e: Exception) {
                 Log.e("Camera2Capture", "[$instanceTag] openCamera failed", e)
                 latch.countDown()
+                onSessionReady?.invoke(false)
             }
         }
         return sensorOrientation
@@ -477,7 +525,59 @@ class Camera2Capture(
         if (oldCam != null && oldLatch != null) {
             try { oldLatch.await(1200, TimeUnit.MILLISECONDS) } catch (_: Exception) {}
         }
+        while (inFlightAhb.isNotEmpty()) {
+            val item = inFlightAhb.removeFirst()
+            try { item.third.close() } catch (_: Exception) {}
+            try { item.second.close() } catch (_: Exception) {}
+        }
         try { oldReader?.close() } catch (_: Exception) {}
+    }
+
+    private fun pushCpuI420Fallback(img: Image) {
+        val w = img.width and 0xFFFE
+        val hPx = img.height and 0xFFFE
+        if (w <= 0 || hPx <= 0) return
+        val planes = img.planes
+        val yNeed = w * hPx
+        val uvW = w / 2
+        val uvH = hPx / 2
+        val uvNeed = uvW * uvH
+        if (cpuYBuf == null || cpuYBuf!!.capacity() < yNeed) {
+            cpuYBuf = ByteBuffer.allocateDirect(yNeed)
+            cpuUBuf = ByteBuffer.allocateDirect(uvNeed)
+            cpuVBuf = ByteBuffer.allocateDirect(uvNeed)
+        }
+        val yb = cpuYBuf!!; val ub = cpuUBuf!!; val vb = cpuVBuf!!
+        copyPlaneSafe(planes[0].buffer, planes[0].rowStride, planes[0].pixelStride, w, hPx, yb, 0)
+        copyPlaneSafe(planes[1].buffer, planes[1].rowStride, planes[1].pixelStride, uvW, uvH, ub, 128)
+        copyPlaneSafe(planes[2].buffer, planes[2].rowStride, planes[2].pixelStride, uvW, uvH, vb, 128)
+        NativeBridge.nativePushCameraI420(yb, ub, vb, w, uvW, uvW, w, hPx, img.timestamp)
+    }
+
+    private fun copyPlaneSafe(
+        src: ByteBuffer, rowStride: Int, pixelStride: Int, width: Int, height: Int, dst: ByteBuffer, fill: Int,
+    ) {
+        dst.clear()
+        val cap = src.capacity()
+        val fb = fill.toByte()
+        if (cpuRowScratch.size < rowStride) cpuRowScratch = ByteArray(rowStride)
+        val dup = src.duplicate()
+        for (r in 0 until height) {
+            val off = r * rowStride
+            val avail = cap - off
+            if (avail <= 0) { for (c in 0 until width) dst.put(fb); continue }
+            val len = minOf(rowStride, avail)
+            dup.position(off); dup.get(cpuRowScratch, 0, len)
+            if (pixelStride == 1) {
+                val n = minOf(width, len); dst.put(cpuRowScratch, 0, n)
+                for (c in n until width) dst.put(fb)
+            } else {
+                for (c in 0 until width) {
+                    val idx = c * pixelStride
+                    dst.put(if (idx < len) cpuRowScratch[idx] else fb)
+                }
+            }
+        }
     }
 
     fun isRunning(): Boolean = synchronized(lock) { cameraDevice != null }

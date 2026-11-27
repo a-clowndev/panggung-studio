@@ -274,6 +274,115 @@ index 6d1088c..a63fcc1 100644
  }
  
  float3 compute_r10l_reverse(float2 pos, bool limited)
+diff --git a/libobs/obs-encoder.c b/libobs/obs-encoder.c
+index 403f01e..0731832 100644
+--- a/libobs/obs-encoder.c
++++ b/libobs/obs-encoder.c
+@@ -366,6 +366,8 @@ static int lcm(int a, int b)
+ 	return (a / gcd(a, b)) * b;
+ }
+ 
++extern void obs_android_raw_video_encoder_delta(int delta);
++
+ static void add_connection(struct obs_encoder *encoder)
+ {
+ 	if (encoder->info.type == OBS_ENCODER_AUDIO) {
+@@ -380,6 +382,7 @@ static void add_connection(struct obs_encoder *encoder)
+ 		if (gpu_encode_available(encoder)) {
+ 			start_gpu_encode(encoder);
+ 		} else {
++			obs_android_raw_video_encoder_delta(+1);
+ 			start_raw_video(encoder->media, &info, encoder->frame_rate_divisor, receive_video, encoder);
+ 		}
+ 	}
+@@ -418,6 +421,7 @@ static void remove_connection(struct obs_encoder *encoder, bool shutdown)
+ 		if (gpu_encode_available(encoder)) {
+ 			stop_gpu_encode(encoder);
+ 		} else {
++			obs_android_raw_video_encoder_delta(-1);
+ 			stop_raw_video(encoder->media, receive_video, encoder);
+ 		}
+ 	}
+diff --git a/libobs/obs-video.c b/libobs/obs-video.c
+index 13c22cb..9e10b76 100644
+--- a/libobs/obs-video.c
++++ b/libobs/obs-video.c
+@@ -406,6 +406,32 @@ static void render_convert_texture(struct obs_core_video_mix *video, gs_texture_
+ 	profile_end(render_convert_texture_name);
+ }
+ 
++static volatile long g_android_gpu_surface_encoders = 0;
++static volatile long g_android_total_raw_encoders = 0;
++
++EXPORT void obs_android_gpu_surface_encoder_delta(int delta)
++{
++	if (delta > 0)
++		os_atomic_inc_long(&g_android_gpu_surface_encoders);
++	else if (delta < 0)
++		os_atomic_dec_long(&g_android_gpu_surface_encoders);
++}
++
++void obs_android_raw_video_encoder_delta(int delta)
++{
++	if (delta > 0)
++		os_atomic_inc_long(&g_android_total_raw_encoders);
++	else if (delta < 0)
++		os_atomic_dec_long(&g_android_total_raw_encoders);
++}
++
++static inline bool android_skip_cpu_readback(void)
++{
++	long gpu = os_atomic_load_long(&g_android_gpu_surface_encoders);
++	long tot = os_atomic_load_long(&g_android_total_raw_encoders);
++	return gpu > 0 && tot > 0 && gpu >= tot;
++}
++
+ static const char *stage_output_texture_name = "stage_output_texture";
+ static inline void stage_output_texture(struct obs_core_video_mix *video, int cur_texture,
+ 					gs_texture_t *const *const convert_textures, gs_texture_t *output_texture,
+@@ -571,7 +597,7 @@ static inline void render_video(struct obs_core_video_mix *video, bool raw_activ
+ 			output_gpu_encoders(video, raw_active);
+ 		}
+ 
+-		if (raw_active) {
++		if (raw_active && !android_skip_cpu_readback()) {
+ 			stage_output_texture(video, cur_texture, convert_textures, output_texture, copy_surfaces,
+ 					     channel_count);
+ 		}
+@@ -787,10 +813,12 @@ static inline void output_video_data(struct obs_core_video_mix *video, struct vi
+ 
+ 	locked = video_output_lock_frame(video->video, &output_frame, count, input_frame->timestamp);
+ 	if (locked) {
+-		if (video->gpu_conversion) {
+-			set_gpu_converted_data(&output_frame, input_frame, info);
+-		} else {
+-			copy_rgbx_frame(&output_frame, input_frame, info);
++		if (!android_skip_cpu_readback()) {
++			if (video->gpu_conversion) {
++				set_gpu_converted_data(&output_frame, input_frame, info);
++			} else {
++				copy_rgbx_frame(&output_frame, input_frame, info);
++			}
+ 		}
+ 
+ 		video_output_unlock_frame(video->video);
+@@ -890,9 +918,13 @@ static inline void output_frame(struct obs_core_video_mix *video)
+ 	profile_end(output_frame_render_video_name);
+ 
+ 	if (raw_active) {
+-		profile_start(output_frame_download_frame_name);
+-		frame_ready = download_frame(video, prev_texture, &frame);
+-		profile_end(output_frame_download_frame_name);
++		if (android_skip_cpu_readback()) {
++			frame_ready = (video->vframe_info_buffer.size >= sizeof(struct obs_vframe_info));
++		} else {
++			profile_start(output_frame_download_frame_name);
++			frame_ready = download_frame(video, prev_texture, &frame);
++			profile_end(output_frame_download_frame_name);
++		}
+ 	}
+ 
+ 	profile_start(output_frame_gs_flush_name);
 diff --git a/libobs/util/platform-nix.c b/libobs/util/platform-nix.c
 index 5648ca6..cfe79b1 100644
 --- a/libobs/util/platform-nix.c

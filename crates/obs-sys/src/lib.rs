@@ -456,14 +456,14 @@ unsafe extern "C" {
         ahb_ptr: *mut c_void,
         width: u32,
         height: u32,
-        timestamp_ns: u64,
-    ) -> bool;
+        frame_seq: u64,
+    ) -> u64;
     pub fn panggung_push_screen_ahb(
         ahb_ptr: *mut c_void,
         width: u32,
         height: u32,
-        timestamp_ns: u64,
-    ) -> bool;
+        frame_seq: u64,
+    ) -> u64;
     pub fn panggung_push_camera_i420(
         y: *const u8,
         u: *const u8,

@@ -612,6 +612,14 @@ fn dispatch_request(req_type: &str, data: &Value) -> (bool, Value) {
             let v: Value = serde_json::from_str(&crate::studio_ops::ws_get_source_transform_json(n)).unwrap_or(json!({}));
             (true, v)
         }
+        "SetSourceCrop" => {
+            let n = data.get("sourceName").and_then(|x| x.as_str()).unwrap_or("");
+            let left = data.get("cropLeft").or_else(|| data.get("left")).and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+            let top = data.get("cropTop").or_else(|| data.get("top")).and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+            let right = data.get("cropRight").or_else(|| data.get("right")).and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+            let bottom = data.get("cropBottom").or_else(|| data.get("bottom")).and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+            (crate::studio_ops::ws_set_source_crop(n, left, top, right, bottom), json!({}))
+        }
         "SetStudioTBar" => {
             let t = data.get("t").and_then(|x| x.as_f64()).unwrap_or(0.5) as f32;
             (crate::studio_ops::ws_set_studio_tbar(t), json!({}))

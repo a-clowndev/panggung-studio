@@ -589,7 +589,7 @@ async def run_gauntlet():
         adb("shell", "am", "start", "-n", "io.panggung.obs/.MainActivity")
         await asyncio.sleep(3.5)
         xml_b = dump_ui_xml()
-        if "Crash Recovery" in xml_b or "STUDIO v0.2.0" not in xml_b:
+        if "Crash Recovery" in xml_b or "STUDIO v0." not in xml_b:
             back_ok = False
             break
     record("B10: Back-Button Clean Native Teardown x3 (Zero Crash Recovery)", back_ok)

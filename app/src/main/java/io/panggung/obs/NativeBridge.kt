@@ -27,11 +27,11 @@ object NativeBridge {
     external fun nativeDetachSurface()
 
     external fun nativePushCameraHardwareBuffer(
-        sourceName: String, hwBuf: HardwareBuffer, width: Int, height: Int, timestampNs: Long,
-    ): Boolean
+        sourceName: String, hwBuf: HardwareBuffer, width: Int, height: Int, frameSeq: Long,
+    ): Long
     external fun nativePushScreenHardwareBuffer(
-        hwBuf: HardwareBuffer, width: Int, height: Int, timestampNs: Long,
-    ): Boolean
+        hwBuf: HardwareBuffer, width: Int, height: Int, frameSeq: Long,
+    ): Long
     external fun nativePushCameraI420(
         yBuf: ByteBuffer, uBuf: ByteBuffer, vBuf: ByteBuffer,
         yStride: Int, uStride: Int, vStride: Int, width: Int, height: Int, timestampNs: Long,

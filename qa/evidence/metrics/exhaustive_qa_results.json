@@ -1,0 +1,221 @@
+{
+  "timestamp": "2026-11-27T17:03:41+0700",
+  "office_mode": {
+    "volume_before": 0,
+    "volume_after": 0,
+    "silent_verified": true
+  },
+  "regression_suites": [
+    {
+      "suite": "e2e_device_test",
+      "exit_code": 0,
+      "status": "PASS",
+      "elapsed_s": 31.8,
+      "summary": "=== FULL E2E REGRESSION SUMMARY: 64/64 PASSED ===",
+      "evidence": "qa/evidence/logcat/reg_e2e_device_test.log"
+    },
+    {
+      "suite": "srt_reconnect_e2e_test",
+      "exit_code": 0,
+      "status": "PASS",
+      "elapsed_s": 35.3,
+      "summary": "=== ALL HARDENED E2E TESTS PASSED ===",
+      "evidence": "qa/evidence/logcat/reg_srt_reconnect_e2e_test.log"
+    },
+    {
+      "suite": "golden_ssim_test",
+      "exit_code": 0,
+      "status": "PASS",
+      "elapsed_s": 1.3,
+      "summary": "[PASS] Updated cropped golden reference (crop=iw*0.60:ih*0.42:iw*0.20:ih*0.06, YAVG=42.4, YMAX=226.0)",
+      "evidence": "qa/evidence/logcat/reg_golden_ssim_test.log"
+    },
+    {
+      "suite": "golden_ssim_verify",
+      "exit_code": 0,
+      "status": "PASS",
+      "elapsed_s": 1.2,
+      "summary": "[PASS] Cropped Preview SSIM=1.0000 (min=0.85, YAVG=42.4, YMAX=226.0)",
+      "evidence": "qa/evidence/logcat/reg_golden_ssim_verify.log"
+    },
+    {
+      "suite": "soak_test_15s",
+      "exit_code": 0,
+      "status": "PASS",
+      "elapsed_s": 18.6,
+      "summary": "SOAK_TEST_ASSERTIONS_PASSED",
+      "evidence": "qa/evidence/logcat/reg_soak_test_15s.log"
+    },
+    {
+      "suite": "zerocopy_procam_e2e_test",
+      "exit_code": 0,
+      "status": "PASS",
+      "elapsed_s": 84.4,
+      "summary": "=== HARDENED v0.3.0-alpha.1 E2E SUMMARY: 7/7 PASSED ===",
+      "evidence": "qa/evidence/logcat/reg_zerocopy_procam_e2e_test.log"
+    },
+    {
+      "suite": "ui_tap_e2e_test",
+      "exit_code": 1,
+      "status": "FAIL",
+      "elapsed_s": 188.9,
+      "summary": "=== FULL UI TAP E2E SUMMARY: 11/12 PASSED ===",
+      "evidence": "qa/evidence/logcat/reg_ui_tap_e2e_test.log"
+    },
+    {
+      "suite": "barbar_chaos_security_test",
+      "exit_code": 0,
+      "status": "PASS",
+      "elapsed_s": 202.8,
+      "summary": "=== BARBAR CHAOS & SECURITY GAUNTLET SUMMARY: 12/12 PASSED ===",
+      "evidence": "qa/evidence/logcat/reg_barbar_chaos_security_test.log"
+    },
+    {
+      "suite": "stress_test_all",
+      "exit_code": 0,
+      "status": "PASS",
+      "elapsed_s": 104.9,
+      "summary": "=== ALL-FEATURES STRESS TEST SUMMARY: 7/7 PASSED ===",
+      "evidence": "qa/evidence/logcat/reg_stress_test_all.log"
+    }
+  ],
+  "exhaustive_flows": [
+    {
+      "id": "F01",
+      "name": "Rapid Start->Immediate Stop & Repeated Start While Connecting",
+      "status": "PASS",
+      "detail": "start1=True start2=True stop=True alive=True",
+      "evidence": ""
+    },
+    {
+      "id": "F02",
+      "name": "Mid-Recording Encoder Switch Anomaly + Playable Output",
+      "status": "PASS",
+      "detail": "enc_switch=True decode=True dur=3.1s codec=h264",
+      "evidence": "qa/evidence/ffprobe/f02_mid_switch.json"
+    },
+    {
+      "id": "F03",
+      "name": "Extended WS API Surface (22 endpoints incl. Security Blocks)",
+      "status": "PASS",
+      "detail": "passed=22/22 failed=[]",
+      "evidence": ""
+    },
+    {
+      "id": "F04",
+      "name": "Digital Audio + Non-Black Pixel + PTS Monotonicity Audit (8s Live Rec)",
+      "status": "PASS",
+      "detail": "codec=h264/aac YAVG=16.5 drift=26.3ms mono=True audio_mean=-54.0dB",
+      "evidence": "qa/evidence/ffprobe/f04_digital_av_audit.json"
+    },
+    {
+      "id": "F05",
+      "name": "Multi-Resolution Zero-Readback GPU-Surface Perf Benchmarks (4 profiles)",
+      "status": "PASS",
+      "detail": "720p30/1080p30/1080p60/9:16 measured",
+      "evidence": ""
+    },
+    {
+      "id": "F06",
+      "name": "Persistent Crop Round-Trip Across Force-Stop",
+      "status": "PARTIAL",
+      "detail": "before={'crop_left': None, 'crop_top': None, 'crop_right': None, 'crop_bottom': None} after={'crop_left': None, 'crop_top': None, 'crop_right': None, 'crop_bottom': None}",
+      "evidence": ""
+    },
+    {
+      "id": "F07",
+      "name": "Android Lifecycle Chaos (Background/Foreground + Camera Perm Revoke/Regrant)",
+      "status": "PASS",
+      "detail": "resumed=True recovered=True crashes=[]",
+      "evidence": "qa/evidence/logcat/phase_b_chaos.log"
+    }
+  ],
+  "perf_benchmarks": [
+    {
+      "profile": "720p30_landscape",
+      "target_fps": 30,
+      "avg_fps": 30.0,
+      "min_fps": 30.0,
+      "ft_p50_ms": 3.47,
+      "ft_p95_ms": 4.84,
+      "ft_p99_ms": 4.84,
+      "pss_start_mb": 150.8,
+      "pss_peak_mb": 153.5,
+      "batt_temp_c": 39.7
+    },
+    {
+      "profile": "1080p30_landscape",
+      "target_fps": 30,
+      "avg_fps": 30.0,
+      "min_fps": 30.0,
+      "ft_p50_ms": 4.28,
+      "ft_p95_ms": 4.73,
+      "ft_p99_ms": 4.73,
+      "pss_start_mb": 150.9,
+      "pss_peak_mb": 170.0,
+      "batt_temp_c": 39.8
+    },
+    {
+      "profile": "1080p60_landscape",
+      "target_fps": 60,
+      "avg_fps": 60.0,
+      "min_fps": 60.0,
+      "ft_p50_ms": 4.22,
+      "ft_p95_ms": 4.52,
+      "ft_p99_ms": 4.52,
+      "pss_start_mb": 150.6,
+      "pss_peak_mb": 173.6,
+      "batt_temp_c": 39.8
+    },
+    {
+      "profile": "720p30_portrait_9x16",
+      "target_fps": 30,
+      "avg_fps": 30.0,
+      "min_fps": 30.0,
+      "ft_p50_ms": 5.48,
+      "ft_p95_ms": 5.86,
+      "ft_p99_ms": 5.86,
+      "pss_start_mb": 147.3,
+      "pss_peak_mb": 153.1,
+      "batt_temp_c": 39.7
+    }
+  ],
+  "media_audits": [
+    {
+      "label": "f02_mid_switch",
+      "decode_ok": true,
+      "video_codec": "h264",
+      "resolution": "1280x720",
+      "pix_fmt": "yuv420p",
+      "audio_codec": "aac",
+      "audio_sr": "48000",
+      "duration_s": 3.1,
+      "av_drift_ms": 7.0,
+      "pts_monotonic": true,
+      "pts_packets": 93,
+      "yavg_mean": 172.0,
+      "ymax_max": 172.0,
+      "audio_mean_db": -26.8,
+      "audio_max_db": -11.2,
+      "evidence": "qa/evidence/ffprobe/f02_mid_switch.json"
+    },
+    {
+      "label": "f04_digital_av_audit",
+      "decode_ok": true,
+      "video_codec": "h264",
+      "resolution": "1280x720",
+      "pix_fmt": "yuv420p",
+      "audio_codec": "aac",
+      "audio_sr": "48000",
+      "duration_s": 8.13,
+      "av_drift_ms": 26.3,
+      "pts_monotonic": true,
+      "pts_packets": 244,
+      "yavg_mean": 16.5,
+      "ymax_max": 55.0,
+      "audio_mean_db": -54.0,
+      "audio_max_db": -20.0,
+      "evidence": "qa/evidence/ffprobe/f04_digital_av_audit.json"
+    }
+  ]
+}

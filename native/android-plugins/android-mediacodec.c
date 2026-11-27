@@ -6,6 +6,7 @@
 #include <obs.h>
 #include <graphics/graphics.h>
 #include <util/darray.h>
+#include <util/platform.h>
 #include <util/threading.h>
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaFormat.h>
@@ -29,6 +30,8 @@
 #define COLOR_TRANSFER_SDR_VIDEO 3
 #define COLOR_TRANSFER_ST2084 6
 #define COLOR_TRANSFER_HLG 7
+
+extern void obs_android_gpu_surface_encoder_delta(int delta);
 
 typedef EGLBoolean(EGLAPIENTRYP PFNEGLPRESENTATIONTIMEANDROIDPROC_L)(EGLDisplay dpy, EGLSurface surface, EGLnsecsANDROID time);
 static PFNEGLPRESENTATIONTIMEANDROIDPROC_L p_eglPresentationTimeANDROID = NULL;
@@ -120,6 +123,10 @@ struct mc_encoder {
 	bool destroying;
 	volatile long encode_credit; /* Backpressure gate: prevents BufferQueue deadlock on PauseRecord / StopRecord */
 	uint64_t surface_frames_pushed;
+	uint64_t start_video_ns;
+	uint64_t last_active_ns;
+	uint64_t paused_accum_ns;
+	bool was_paused;
 
 	DARRAY(uint8_t) extra_data;
 	DARRAY(uint8_t) packet_buf;
@@ -139,6 +146,10 @@ static void mc_on_main_rendered(void *param)
 	/* Backpressure gate: only blit into MediaCodec ANativeWindow when mc_encode() is actively draining outputs.
 	 * Guarantees eglSwapBuffers() NEVER blocks on BufferQueue during PauseRecord or StopRecord! */
 	if (os_atomic_load_long(&enc->encode_credit) <= 0) {
+		if (!enc->was_paused && enc->start_video_ns > 0) {
+			enc->was_paused = true;
+			enc->last_active_ns = obs_get_video_frame_time();
+		}
 		pthread_mutex_unlock(&enc->surface_lock);
 		return;
 	}
@@ -229,9 +240,23 @@ static void mc_on_main_rendered(void *param)
 		glBindVertexArray(g_mc_blit_vao);
 		glDrawArrays(GL_TRIANGLES, 0, 3);
 
-		int64_t pts_ns = (int64_t)((enc->surface_frames_pushed * 1000000000ULL * enc->fps_den) / enc->fps_num);
+		/* Use OBS's real monotonic video clock (not frame counter) so thermal drops/pauses never drift A/V! */
+		uint64_t now_vns = obs_get_video_frame_time();
+		if (now_vns == 0) now_vns = os_gettime_ns();
+		if (enc->start_video_ns == 0) {
+			enc->start_video_ns = now_vns;
+		}
+		if (enc->was_paused) {
+			if (now_vns > enc->last_active_ns) {
+				enc->paused_accum_ns += (now_vns - enc->last_active_ns);
+			}
+			enc->was_paused = false;
+		}
+		uint64_t elapsed_ns = (now_vns > enc->start_video_ns + enc->paused_accum_ns)
+					      ? (now_vns - enc->start_video_ns - enc->paused_accum_ns)
+					      : 0ULL;
 		if (p_eglPresentationTimeANDROID) {
-			p_eglPresentationTimeANDROID(dpy, enc->egl_surface, (EGLnsecsANDROID)pts_ns);
+			p_eglPresentationTimeANDROID(dpy, enc->egl_surface, (EGLnsecsANDROID)elapsed_ns);
 		}
 		eglSwapBuffers(dpy, enc->egl_surface);
 		enc->surface_frames_pushed++;
@@ -414,6 +439,7 @@ static void *mc_create_common(obs_data_t *settings, obs_encoder_t *encoder, cons
 
 	if (enc->use_surface) {
 		os_atomic_set_long(&enc->encode_credit, 2);
+		obs_android_gpu_surface_encoder_delta(+1);
 		obs_add_main_rendered_callback(mc_on_main_rendered, enc);
 	}
 
@@ -441,6 +467,7 @@ static void mc_destroy(void *data)
 		pthread_mutex_unlock(&enc->surface_lock);
 
 		obs_remove_main_rendered_callback(mc_on_main_rendered, enc);
+		obs_android_gpu_surface_encoder_delta(-1);
 
 		pthread_mutex_lock(&enc->surface_lock);
 		EGLSurface surf = enc->egl_surface;

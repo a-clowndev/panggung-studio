@@ -11,6 +11,7 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
+import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.os.Handler
@@ -20,7 +21,9 @@ import android.util.Log
 import android.view.Display
 import io.panggung.obs.NativeBridge
 import java.nio.ByteBuffer
+import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Android 14+ Compliant Screen Capture (T-C03) + Per-App Audio Capture (T-D03):
@@ -41,6 +44,8 @@ class ScreenCapture {
     private var currentH: Int = 0
     private val audioRunning = AtomicBoolean(false)
     private var audioThread: Thread? = null
+    private val frameSeq = AtomicLong(0)
+    private val inFlightAhb = ArrayDeque<Triple<Long, Image, HardwareBuffer>>()
 
     @SuppressLint("MissingPermission")
     fun start(
@@ -159,36 +164,66 @@ class ScreenCapture {
         try { oldReader?.close() } catch (_: Exception) {}
     }
 
+    private fun drainInFlightAhb() {
+        while (inFlightAhb.isNotEmpty()) {
+            val item = inFlightAhb.removeFirst()
+            try { item.third.close() } catch (_: Exception) {}
+            try { item.second.close() } catch (_: Exception) {}
+        }
+    }
+
     private fun createImageReader(width: Int, height: Int, h: Handler): ImageReader {
-        // Zero-Copy GPU AHardwareBuffer Screen Capture (USAGE_GPU_SAMPLED_IMAGE, zero CPU memcpy!)
-        return ImageReader.newInstance(
-            width,
-            height,
-            PixelFormat.RGBA_8888,
-            3,
-            HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
-        ).apply {
-            setOnImageAvailableListener({ r ->
+        // Zero-Copy GPU AHardwareBuffer Screen Capture with automatic IllegalArgumentException fallback to CPU RGBA
+        var useAhb = true
+        val ir = try {
+            ImageReader.newInstance(
+                width,
+                height,
+                PixelFormat.RGBA_8888,
+                4,
+                HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
+            )
+        } catch (e: Exception) {
+            Log.w("ScreenCapture", "AHB RGBA_8888+USAGE_GPU_SAMPLED_IMAGE unsupported (${e.message}), falling back to CPU RGBA")
+            useAhb = false
+            ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 3)
+        }
+
+        if (useAhb) {
+            ir.setOnImageAvailableListener({ r ->
+                while (inFlightAhb.size >= 3) {
+                    val oldest = inFlightAhb.removeFirst()
+                    try { oldest.third.close() } catch (_: Exception) {}
+                    try { oldest.second.close() } catch (_: Exception) {}
+                }
+                val img = try { r.acquireLatestImage() } catch (_: Exception) { null } ?: return@setOnImageAvailableListener
+                val hb = try { img.hardwareBuffer } catch (_: Exception) { null }
+                if (hb == null) {
+                    img.close()
+                    return@setOnImageAvailableListener
+                }
+                val seq = frameSeq.incrementAndGet()
+                inFlightAhb.addLast(Triple(seq, img, hb))
+                val releasedSeq = NativeBridge.nativePushScreenHardwareBuffer(hb, img.width, img.height, seq)
+                // Close ONLY images whose GPU EGLSyncKHR fence has already completed!
+                while (inFlightAhb.isNotEmpty() && inFlightAhb.first().first <= releasedSeq) {
+                    val done = inFlightAhb.removeFirst()
+                    try { done.third.close() } catch (_: Exception) {}
+                    try { done.second.close() } catch (_: Exception) {}
+                }
+            }, h)
+        } else {
+            ir.setOnImageAvailableListener({ r ->
                 val img = try { r.acquireLatestImage() } catch (_: Exception) { null } ?: return@setOnImageAvailableListener
                 try {
-                    val hb = img.hardwareBuffer
-                    if (hb != null) {
-                        try {
-                            NativeBridge.nativePushScreenHardwareBuffer(
-                                hb,
-                                img.width,
-                                img.height,
-                                img.timestamp,
-                            )
-                        } finally {
-                            hb.close()
-                        }
-                    }
+                    val plane = img.planes[0]
+                    NativeBridge.nativePushScreenRgba(plane.buffer, plane.rowStride, img.width, img.height, img.timestamp)
                 } finally {
                     img.close()
                 }
             }, h)
         }
+        return ir
     }
 
     @SuppressLint("MissingPermission")
@@ -255,6 +290,7 @@ class ScreenCapture {
         try { audioThread?.join(300) } catch (_: Exception) {}
         audioThread = null
         try { virtualDisplay?.release() } catch (_: Exception) {}
+        drainInFlightAhb()
         try { reader?.close() } catch (_: Exception) {}
         try { projection?.stop() } catch (_: Exception) {}
         try { thread?.quitSafely() } catch (_: Exception) {}

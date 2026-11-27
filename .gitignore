@@ -78,6 +78,13 @@ venv/
 /docs/
 /design/
 
+# Raw QA device captures, screenshots & logcat dumps (keep qa/*.md, qa/scripts/, metrics & ffprobe JSON)
+/qa/evidence/recordings/
+/qa/evidence/screenshots/
+/qa/evidence/logcat/
+/qa/evidence/native-crashes/
+/qa/evidence/ui-dumps/
+
 # OS metadata
 .DS_Store
 Thumbs.db

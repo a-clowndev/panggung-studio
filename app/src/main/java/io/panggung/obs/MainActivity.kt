@@ -1581,19 +1581,39 @@ class MainActivity : ComponentActivity() {
         if (snapshot.sources.none { it.name == "Front Camera" }) {
             NativeBridge.nativeAddSource("android_camera", "Front Camera", "")
         }
+        val backOk = java.util.concurrent.atomic.AtomicInteger(-1) // -1=pending, 1=ok, 0=fail
+        val frontOk = java.util.concurrent.atomic.AtomicInteger(-1)
+        fun checkBothReady() {
+            val b = backOk.get(); val f = frontOk.get()
+            if (b == 1 && f == 1) {
+                runOnUiThread {
+                    dualCamActive = true
+                    statusBanner = "Concurrent Dual-Cam active (Back=${pair.first} + Front=${pair.second} PiP)"
+                    refreshSnapshot()
+                }
+            } else if (b == 0 || f == 0) {
+                dualCameraCapture.stop()
+                runOnUiThread {
+                    dualCamActive = false
+                    statusBanner = "Concurrent dual-camera session rejected by HAL"
+                    refreshSnapshot()
+                }
+            }
+        }
         val backDeg = cameraCapture.start(
             front = false, width = 1280, height = 720,
             explicitCameraId = pair.first, sourceName = "Back Camera",
+            onSessionReady = { ok -> backOk.set(if (ok) 1 else 0); checkBothReady() },
         )
         val frontDeg = dualCameraCapture.start(
             front = true, width = 640, height = 480,
             explicitCameraId = pair.second, sourceName = "Front Camera",
+            onSessionReady = { ok -> frontOk.set(if (ok) 1 else 0); checkBothReady() },
         )
         NativeBridge.nativeFitSourceToScreen("Back Camera")
         val pipRot = if (baseH > baseW) frontDeg.toFloat() else 0f
         NativeBridge.nativeSetSourceTransform("Front Camera", baseW * 0.78f, baseH * 0.74f, 0.30f, 0.30f, pipRot)
-        dualCamActive = true
-        statusBanner = "Concurrent Dual-Cam active (Back=${pair.first}/${backDeg}° + Front=${pair.second}/${frontDeg}° PiP)"
+        statusBanner = "Starting Concurrent Dual-Cam (Back=${pair.first}/${backDeg}° + Front=${pair.second}/${frontDeg}°)..."
         refreshSnapshot()
     }
 

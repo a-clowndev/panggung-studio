@@ -116,6 +116,7 @@ pub(crate) fn ws_set_source_crop(name: &str, left: i32, top: i32, right: i32, bo
         };
         sys::obs_sceneitem_set_crop(item, &crop);
     }
+    crate::auto_save_scene_collection_locked(state);
     true
 }
 

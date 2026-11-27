@@ -16,12 +16,15 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* ---- EGL / GLES External OES Extension Loader ---- */
+/* ---- EGL / GLES External OES & EGLSyncKHR Extension Loader ---- */
 typedef EGLClientBuffer(EGLAPIENTRYP PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC_L)(const struct AHardwareBuffer *buffer);
 typedef EGLImageKHR(EGLAPIENTRYP PFNEGLCREATEIMAGEKHRPROC_L)(EGLDisplay dpy, EGLContext ctx, EGLenum target,
 							      EGLClientBuffer buffer, const EGLint *attrib_list);
 typedef EGLBoolean(EGLAPIENTRYP PFNEGLDESTROYIMAGEKHRPROC_L)(EGLDisplay dpy, EGLImageKHR image);
 typedef void(GL_APIENTRYP PFNGLEGLIMAGETARGETTEXTURE2DOESPROC_L)(GLenum target, GLeglImageOES image);
+typedef EGLSyncKHR(EGLAPIENTRYP PFNEGLCREATESYNCKHRPROC_L)(EGLDisplay dpy, EGLenum type, const EGLint *attrib_list);
+typedef EGLBoolean(EGLAPIENTRYP PFNEGLDESTROYSYNCKHRPROC_L)(EGLDisplay dpy, EGLSyncKHR sync);
+typedef EGLint(EGLAPIENTRYP PFNEGLCLIENTWAITSYNCKHRPROC_L)(EGLDisplay dpy, EGLSyncKHR sync, EGLint flags, EGLTimeKHR timeout);
 
 #ifndef EGL_NATIVE_BUFFER_ANDROID
 #define EGL_NATIVE_BUFFER_ANDROID 0x3140
@@ -29,11 +32,20 @@ typedef void(GL_APIENTRYP PFNGLEGLIMAGETARGETTEXTURE2DOESPROC_L)(GLenum target, 
 #ifndef EGL_IMAGE_PRESERVED_KHR
 #define EGL_IMAGE_PRESERVED_KHR 0x30D2
 #endif
+#ifndef EGL_SYNC_FENCE_KHR
+#define EGL_SYNC_FENCE_KHR 0x30F9
+#endif
+#ifndef EGL_SYNC_FLUSH_COMMANDS_BIT_KHR
+#define EGL_SYNC_FLUSH_COMMANDS_BIT_KHR 0x0001
+#endif
 
 static PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC_L p_eglGetNativeClientBufferANDROID = NULL;
 static PFNEGLCREATEIMAGEKHRPROC_L p_eglCreateImageKHR = NULL;
 static PFNEGLDESTROYIMAGEKHRPROC_L p_eglDestroyImageKHR = NULL;
 static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC_L p_glEGLImageTargetTexture2DOES = NULL;
+static PFNEGLCREATESYNCKHRPROC_L p_eglCreateSyncKHR = NULL;
+static PFNEGLDESTROYSYNCKHRPROC_L p_eglDestroySyncKHR = NULL;
+static PFNEGLCLIENTWAITSYNCKHRPROC_L p_eglClientWaitSyncKHR = NULL;
 static bool g_egl_exts_loaded = false;
 
 static bool load_ahb_egl_exts(void)
@@ -45,6 +57,9 @@ static bool load_ahb_egl_exts(void)
 		p_eglDestroyImageKHR = (PFNEGLDESTROYIMAGEKHRPROC_L)eglGetProcAddress("eglDestroyImageKHR");
 		p_glEGLImageTargetTexture2DOES =
 			(PFNGLEGLIMAGETARGETTEXTURE2DOESPROC_L)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+		p_eglCreateSyncKHR = (PFNEGLCREATESYNCKHRPROC_L)eglGetProcAddress("eglCreateSyncKHR");
+		p_eglDestroySyncKHR = (PFNEGLDESTROYSYNCKHRPROC_L)eglGetProcAddress("eglDestroySyncKHR");
+		p_eglClientWaitSyncKHR = (PFNEGLCLIENTWAITSYNCKHRPROC_L)eglGetProcAddress("eglClientWaitSyncKHR");
 		g_egl_exts_loaded = true;
 	}
 	return p_eglGetNativeClientBufferANDROID && p_eglCreateImageKHR &&
@@ -122,7 +137,7 @@ static bool ensure_oes_blit_program(void)
 	return true;
 }
 
-/* ---- Zero-Copy AHardwareBuffer + Multi-Instance Video Source ---- */
+/* ---- Zero-Copy AHardwareBuffer (EGLSyncKHR fenced) + Real CPU Fallback Video Source ---- */
 #define MAX_CAM_INSTANCES 4
 
 struct ahb_video_source {
@@ -130,26 +145,32 @@ struct ahb_video_source {
 	obs_source_t *source;
 	char label[64];
 
-	/* Pending GPU AHardwareBuffer (written by Camera2/Screen thread, consumed on OBS render thread) */
+	/* Pending GPU AHardwareBuffer + frame_seq ownership handshake with Kotlin ImageReader */
 	AHardwareBuffer *pending_ahb;
+	uint64_t pending_seq;
 	uint32_t pending_w;
 	uint32_t pending_h;
 	bool has_new_ahb;
 
+	/* Highest frame_seq guaranteed finished by GPU (via EGLSyncKHR fence or superseded before read).
+	 * Kotlin ONLY calls Image.close() for images with seq <= released_seq, guaranteeing zero producer overwrite! */
+	uint64_t released_seq;
+
+	/* Real CPU Fallback RGBA buffer (for devices where ImageFormat.PRIVATE/RGBA+GPU_SAMPLED is unsupported) */
+	uint8_t *pending_rgba;
+	size_t pending_rgba_cap;
+	uint32_t pending_rgba_w;
+	uint32_t pending_rgba_h;
+	bool has_new_rgba;
+
 	/* Active GPU resources (owned exclusively by OBS graphics thread) */
-	AHardwareBuffer *cur_ahb;
-	EGLImageKHR cur_egl_image;
 	GLuint oes_tex;
 	gs_texture_t *obs_tex;
+	bool obs_tex_is_dynamic;
 	uint32_t tex_w;
 	uint32_t tex_h;
 	uint64_t ahb_frames;
-
-	/* CPU fallback color matrix (for legacy I420 / RGBA pushes) */
-	bool color_matrix_ready;
-	float color_matrix[16];
-	float color_range_min[3];
-	float color_range_max[3];
+	uint64_t cpu_frames;
 };
 
 static pthread_mutex_t g_cam_registry_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -167,28 +188,9 @@ static struct android_source_slot g_webview = {PTHREAD_MUTEX_INITIALIZER, NULL};
 static struct android_source_slot g_audio_in = {PTHREAD_MUTEX_INITIALIZER, NULL};
 static struct android_source_slot g_audio_out = {PTHREAD_MUTEX_INITIALIZER, NULL};
 
-static void ensure_color_matrix_ahb(struct ahb_video_source *src)
-{
-	if (!src->color_matrix_ready) {
-		video_format_get_parameters_for_format(
-			VIDEO_CS_601, VIDEO_RANGE_FULL, VIDEO_FORMAT_I420,
-			src->color_matrix, src->color_range_min, src->color_range_max);
-		src->color_matrix_ready = true;
-	}
-}
-
 static void ahb_source_destroy_gpu(struct ahb_video_source *s)
 {
 	obs_enter_graphics();
-	EGLDisplay dpy = eglGetCurrentDisplay();
-	if (s->cur_egl_image != EGL_NO_IMAGE_KHR && dpy != EGL_NO_DISPLAY && p_eglDestroyImageKHR) {
-		p_eglDestroyImageKHR(dpy, s->cur_egl_image);
-		s->cur_egl_image = EGL_NO_IMAGE_KHR;
-	}
-	if (s->cur_ahb) {
-		AHardwareBuffer_release(s->cur_ahb);
-		s->cur_ahb = NULL;
-	}
 	if (s->oes_tex) {
 		glDeleteTextures(1, &s->oes_tex);
 		s->oes_tex = 0;
@@ -208,18 +210,27 @@ static void ahb_source_render(void *data, gs_effect_t *effect)
 		return;
 
 	AHardwareBuffer *new_ahb = NULL;
+	uint64_t new_seq = 0;
 	uint32_t nw = 0, nh = 0;
+	bool do_cpu = false;
+	uint32_t cw = 0, ch = 0;
 
 	pthread_mutex_lock(&s->lock);
 	if (s->has_new_ahb && s->pending_ahb) {
 		new_ahb = s->pending_ahb;
+		new_seq = s->pending_seq;
 		s->pending_ahb = NULL;
 		s->has_new_ahb = false;
 		nw = s->pending_w;
 		nh = s->pending_h;
+	} else if (s->has_new_rgba && s->pending_rgba && s->pending_rgba_w > 0 && s->pending_rgba_h > 0) {
+		do_cpu = true;
+		cw = s->pending_rgba_w;
+		ch = s->pending_rgba_h;
 	}
 	pthread_mutex_unlock(&s->lock);
 
+	/* Path A: Zero-Copy AHardwareBuffer -> EGLImageKHR -> FBO blit -> EGLSyncKHR fence -> release */
 	if (new_ahb && nw > 0 && nh > 0 && load_ahb_egl_exts() && ensure_oes_blit_program()) {
 		EGLDisplay dpy = eglGetCurrentDisplay();
 		if (dpy != EGL_NO_DISPLAY) {
@@ -231,10 +242,11 @@ static void ahb_source_render(void *data, gs_effect_t *effect)
 				if (!s->oes_tex) {
 					glGenTextures(1, &s->oes_tex);
 				}
-				if (!s->obs_tex || s->tex_w != nw || s->tex_h != nh) {
+				if (!s->obs_tex || s->obs_tex_is_dynamic || s->tex_w != nw || s->tex_h != nh) {
 					if (s->obs_tex)
 						gs_texture_destroy(s->obs_tex);
 					s->obs_tex = gs_texture_create(nw, nh, GS_RGBA, 1, NULL, GS_RENDER_TARGET);
+					s->obs_tex_is_dynamic = false;
 					s->tex_w = nw;
 					s->tex_h = nh;
 				}
@@ -276,6 +288,19 @@ static void ahb_source_render(void *data, gs_effect_t *effect)
 					glBindVertexArray(g_oes_vao);
 					glDrawArrays(GL_TRIANGLES, 0, 3);
 
+					/* Fence GPU completion of OES sampling BEFORE releasing AHardwareBuffer / Image! */
+					if (p_eglCreateSyncKHR && p_eglClientWaitSyncKHR && p_eglDestroySyncKHR) {
+						EGLSyncKHR fence = p_eglCreateSyncKHR(dpy, EGL_SYNC_FENCE_KHR, NULL);
+						if (fence != EGL_NO_SYNC_KHR) {
+							p_eglClientWaitSyncKHR(dpy, fence, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, 50000000ULL);
+							p_eglDestroySyncKHR(dpy, fence);
+						} else {
+							glFinish();
+						}
+					} else {
+						glFinish();
+					}
+
 					glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
 					glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
 
@@ -291,30 +316,48 @@ static void ahb_source_render(void *data, gs_effect_t *effect)
 					if (prev_cull) glEnable(GL_CULL_FACE);
 					if (prev_scissor) glEnable(GL_SCISSOR_TEST);
 
-					/* Release previous frame's EGLImage & AHardwareBuffer */
-					if (s->cur_egl_image != EGL_NO_IMAGE_KHR && p_eglDestroyImageKHR) {
-						p_eglDestroyImageKHR(dpy, s->cur_egl_image);
-					}
-					if (s->cur_ahb) {
-						AHardwareBuffer_release(s->cur_ahb);
-					}
-					s->cur_egl_image = img;
-					s->cur_ahb = new_ahb;
-					new_ahb = NULL;
-
 					s->ahb_frames++;
 					if (s->ahb_frames == 1 || (s->ahb_frames % 300) == 0) {
-						blog(LOG_INFO, "[ahb-zero-copy] '%s' GPU frame #%llu (%ux%u) via EGLImageKHR",
+						blog(LOG_INFO, "[ahb-zero-copy] '%s' GPU frame #%llu (%ux%u) via EGLImageKHR+EGLSync",
 						     s->label, (unsigned long long)s->ahb_frames, nw, nh);
 					}
-				} else {
-					p_eglDestroyImageKHR(dpy, img);
 				}
+				/* Safe to destroy EGLImage now because GPU fence already completed */
+				p_eglDestroyImageKHR(dpy, img);
 			}
 		}
 	}
 	if (new_ahb) {
 		AHardwareBuffer_release(new_ahb);
+		pthread_mutex_lock(&s->lock);
+		if (new_seq > s->released_seq)
+			s->released_seq = new_seq;
+		pthread_mutex_unlock(&s->lock);
+	}
+
+	/* Path B: Real CPU Fallback Upload (for devices where AHB ImageReader fails) */
+	if (do_cpu) {
+		if (!s->obs_tex || !s->obs_tex_is_dynamic || s->tex_w != cw || s->tex_h != ch) {
+			if (s->obs_tex)
+				gs_texture_destroy(s->obs_tex);
+			s->obs_tex = gs_texture_create(cw, ch, GS_RGBA, 1, NULL, GS_DYNAMIC);
+			s->obs_tex_is_dynamic = true;
+			s->tex_w = cw;
+			s->tex_h = ch;
+		}
+		if (s->obs_tex) {
+			pthread_mutex_lock(&s->lock);
+			if (s->pending_rgba && s->pending_rgba_w == cw && s->pending_rgba_h == ch) {
+				gs_texture_set_image(s->obs_tex, s->pending_rgba, cw * 4, false);
+				s->has_new_rgba = false;
+				s->cpu_frames++;
+				if (s->cpu_frames == 1 || (s->cpu_frames % 300) == 0) {
+					blog(LOG_INFO, "[cpu-fallback] '%s' frame #%llu (%ux%u)",
+					     s->label, (unsigned long long)s->cpu_frames, cw, ch);
+				}
+			}
+			pthread_mutex_unlock(&s->lock);
+		}
 	}
 
 	if (s->obs_tex) {
@@ -325,16 +368,16 @@ static void ahb_source_render(void *data, gs_effect_t *effect)
 static uint32_t ahb_source_get_width(void *data)
 {
 	struct ahb_video_source *s = (struct ahb_video_source *)data;
-	return s ? (s->tex_w ? s->tex_w : s->pending_w) : 0;
+	return s ? (s->tex_w ? s->tex_w : (s->pending_w ? s->pending_w : s->pending_rgba_w)) : 0;
 }
 
 static uint32_t ahb_source_get_height(void *data)
 {
 	struct ahb_video_source *s = (struct ahb_video_source *)data;
-	return s ? (s->tex_h ? s->tex_h : s->pending_h) : 0;
+	return s ? (s->tex_h ? s->tex_h : (s->pending_h ? s->pending_h : s->pending_rgba_h)) : 0;
 }
 
-/* ---- android_camera (Multi-instance + Zero-Copy AHardwareBuffer + Async CPU Fallback) ---- */
+/* ---- android_camera (Multi-instance + Zero-Copy AHardwareBuffer + Real CPU Fallback) ---- */
 static const char *cam_get_name(void *unused) { UNUSED_PARAMETER(unused); return "Android Camera"; }
 
 static void *cam_create(obs_data_t *settings, obs_source_t *source)
@@ -343,10 +386,8 @@ static void *cam_create(obs_data_t *settings, obs_source_t *source)
 	struct ahb_video_source *s = bzalloc(sizeof(struct ahb_video_source));
 	pthread_mutex_init(&s->lock, NULL);
 	s->source = source;
-	s->cur_egl_image = EGL_NO_IMAGE_KHR;
 	const char *nm = obs_source_get_name(source);
 	snprintf(s->label, sizeof(s->label), "%s", nm ? nm : "Camera");
-	ensure_color_matrix_ahb(s);
 
 	pthread_mutex_lock(&g_cam_registry_lock);
 	for (int i = 0; i < MAX_CAM_INSTANCES; i++) {
@@ -377,6 +418,10 @@ static void cam_destroy(void *data)
 		AHardwareBuffer_release(s->pending_ahb);
 		s->pending_ahb = NULL;
 	}
+	if (s->pending_rgba) {
+		bfree(s->pending_rgba);
+		s->pending_rgba = NULL;
+	}
 	s->source = NULL;
 	pthread_mutex_unlock(&s->lock);
 
@@ -398,7 +443,6 @@ static obs_properties_t *cam_properties(void *unused)
 static struct obs_source_info android_camera_info = {
 	.id = "android_camera",
 	.type = OBS_SOURCE_TYPE_INPUT,
-	/* Standard OBS_SOURCE_VIDEO (NOT CUSTOM_DRAW) so libobs binds default/filter effect loop before video_render */
 	.output_flags = OBS_SOURCE_VIDEO,
 	.get_name = cam_get_name,
 	.create = cam_create,
@@ -409,7 +453,7 @@ static struct obs_source_info android_camera_info = {
 	.get_properties = cam_properties,
 };
 
-/* ---- android_screen (Zero-Copy AHardwareBuffer) ---- */
+/* ---- android_screen (Zero-Copy AHardwareBuffer + Real CPU Fallback) ---- */
 static const char *scr_get_name(void *unused) { UNUSED_PARAMETER(unused); return "Android Screen Capture"; }
 
 static void *scr_create(obs_data_t *settings, obs_source_t *source)
@@ -418,7 +462,6 @@ static void *scr_create(obs_data_t *settings, obs_source_t *source)
 	struct ahb_video_source *s = bzalloc(sizeof(struct ahb_video_source));
 	pthread_mutex_init(&s->lock, NULL);
 	s->source = source;
-	s->cur_egl_image = EGL_NO_IMAGE_KHR;
 	snprintf(s->label, sizeof(s->label), "Screen Capture");
 
 	pthread_mutex_lock(&g_screen_registry_lock);
@@ -440,6 +483,10 @@ static void scr_destroy(void *data)
 	if (s->pending_ahb) {
 		AHardwareBuffer_release(s->pending_ahb);
 		s->pending_ahb = NULL;
+	}
+	if (s->pending_rgba) {
+		bfree(s->pending_rgba);
+		s->pending_rgba = NULL;
 	}
 	s->source = NULL;
 	pthread_mutex_unlock(&s->lock);
@@ -558,35 +605,41 @@ static struct obs_source_info android_audio_out_info = {
 	.destroy = aout_destroy,
 };
 
-/* ---- Exported Zero-Copy AHardwareBuffer Push APIs ---- */
+/* ---- Exported Zero-Copy AHardwareBuffer Push APIs (returns released_seq for safe Image.close()) ---- */
 
-static bool submit_ahb_to_slot(struct ahb_video_source *s, AHardwareBuffer *ahb, uint32_t width, uint32_t height)
+static uint64_t submit_ahb_to_slot(struct ahb_video_source *s, AHardwareBuffer *ahb,
+				   uint32_t width, uint32_t height, uint64_t frame_seq)
 {
 	if (!s || !ahb || width == 0 || height == 0)
-		return false;
+		return 0;
 	AHardwareBuffer_acquire(ahb);
 	pthread_mutex_lock(&s->lock);
 	if (s->pending_ahb) {
+		/* Superseded before GPU ever touched it -> safe to release immediately */
 		AHardwareBuffer_release(s->pending_ahb);
+		if (s->pending_seq > s->released_seq)
+			s->released_seq = s->pending_seq;
 	}
 	s->pending_ahb = ahb;
+	s->pending_seq = frame_seq;
 	s->pending_w = width;
 	s->pending_h = height;
 	s->has_new_ahb = true;
+	uint64_t done_seq = s->released_seq;
 	pthread_mutex_unlock(&s->lock);
-	return true;
+	return done_seq;
 }
 
-EXPORT bool panggung_push_camera_ahb(const char *source_name, void *ahb_ptr,
-				     uint32_t width, uint32_t height, uint64_t timestamp_ns)
+EXPORT uint64_t panggung_push_camera_ahb(const char *source_name, void *ahb_ptr,
+					 uint32_t width, uint32_t height, uint64_t frame_seq)
 {
-	UNUSED_PARAMETER(timestamp_ns);
 	AHardwareBuffer *ahb = (AHardwareBuffer *)ahb_ptr;
 	if (!ahb || width == 0 || height == 0)
-		return false;
+		return 0;
 
-	bool pushed = false;
+	uint64_t done_seq = 0;
 	pthread_mutex_lock(&g_cam_registry_lock);
+	struct ahb_video_source *target = NULL;
 	struct ahb_video_source *fallback = NULL;
 	for (int i = 0; i < MAX_CAM_INSTANCES; i++) {
 		struct ahb_video_source *s = g_cam_slots[i];
@@ -596,49 +649,116 @@ EXPORT bool panggung_push_camera_ahb(const char *source_name, void *ahb_ptr,
 			fallback = s;
 		const char *cur_name = obs_source_get_name(s->source);
 		if (source_name && source_name[0] && cur_name && strcmp(cur_name, source_name) == 0) {
-			pushed = submit_ahb_to_slot(s, ahb, width, height);
+			target = s;
 			break;
 		}
 	}
-	if (!pushed && fallback) {
-		pushed = submit_ahb_to_slot(fallback, ahb, width, height);
+	if (!target) target = fallback;
+	if (target) {
+		done_seq = submit_ahb_to_slot(target, ahb, width, height, frame_seq);
 	}
 	pthread_mutex_unlock(&g_cam_registry_lock);
-	return pushed;
+	return done_seq;
 }
 
-EXPORT bool panggung_push_screen_ahb(void *ahb_ptr, uint32_t width, uint32_t height, uint64_t timestamp_ns)
+EXPORT uint64_t panggung_push_screen_ahb(void *ahb_ptr, uint32_t width, uint32_t height, uint64_t frame_seq)
 {
-	UNUSED_PARAMETER(timestamp_ns);
 	AHardwareBuffer *ahb = (AHardwareBuffer *)ahb_ptr;
 	if (!ahb || width == 0 || height == 0)
-		return false;
+		return 0;
 
-	bool pushed = false;
+	uint64_t done_seq = 0;
 	pthread_mutex_lock(&g_screen_registry_lock);
 	if (g_screen_inst) {
-		pushed = submit_ahb_to_slot(g_screen_inst, ahb, width, height);
+		done_seq = submit_ahb_to_slot(g_screen_inst, ahb, width, height, frame_seq);
 	}
 	pthread_mutex_unlock(&g_screen_registry_lock);
-	return pushed;
+	return done_seq;
 }
 
-/* ---- Legacy CPU Push APIs (kept for ABI compatibility & non-AHB fallback) ---- */
+/* ---- Real Working CPU Fallback APIs (I420 Camera & RGBA Screen) ---- */
+
+static inline uint8_t clamp_u8(int v) { return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v)); }
+
+static void submit_rgba_to_slot(struct ahb_video_source *s, const uint8_t *rgba,
+				uint32_t stride, uint32_t width, uint32_t height)
+{
+	if (!s || !rgba || width == 0 || height == 0) return;
+	size_t row_bytes = (size_t)width * 4;
+	size_t need = row_bytes * height;
+	pthread_mutex_lock(&s->lock);
+	if (s->pending_rgba_cap < need) {
+		s->pending_rgba = brealloc(s->pending_rgba, need);
+		s->pending_rgba_cap = need;
+	}
+	if (s->pending_rgba) {
+		for (uint32_t r = 0; r < height; r++) {
+			memcpy(s->pending_rgba + (size_t)r * row_bytes, rgba + (size_t)r * stride, row_bytes);
+		}
+		s->pending_rgba_w = width;
+		s->pending_rgba_h = height;
+		s->has_new_rgba = true;
+	}
+	pthread_mutex_unlock(&s->lock);
+}
 
 EXPORT void panggung_push_camera_i420(const uint8_t *y, const uint8_t *u, const uint8_t *v,
 				      uint32_t y_stride, uint32_t u_stride, uint32_t v_stride,
 				      uint32_t width, uint32_t height, uint64_t timestamp_ns)
 {
-	UNUSED_PARAMETER(y); UNUSED_PARAMETER(u); UNUSED_PARAMETER(v);
-	UNUSED_PARAMETER(y_stride); UNUSED_PARAMETER(u_stride); UNUSED_PARAMETER(v_stride);
-	UNUSED_PARAMETER(width); UNUSED_PARAMETER(height); UNUSED_PARAMETER(timestamp_ns);
+	UNUSED_PARAMETER(timestamp_ns);
+	if (!y || !u || !v || width == 0 || height == 0) return;
+	pthread_mutex_lock(&g_cam_registry_lock);
+	struct ahb_video_source *s = NULL;
+	for (int i = 0; i < MAX_CAM_INSTANCES; i++) {
+		if (g_cam_slots[i] && g_cam_slots[i]->source) {
+			s = g_cam_slots[i];
+			break;
+		}
+	}
+	if (s) {
+		size_t need = (size_t)width * height * 4;
+		pthread_mutex_lock(&s->lock);
+		if (s->pending_rgba_cap < need) {
+			s->pending_rgba = brealloc(s->pending_rgba, need);
+			s->pending_rgba_cap = need;
+		}
+		if (s->pending_rgba) {
+			uint8_t *dst = s->pending_rgba;
+			for (uint32_t row = 0; row < height; row++) {
+				const uint8_t *yp = y + (size_t)row * y_stride;
+				const uint8_t *up = u + (size_t)(row >> 1) * u_stride;
+				const uint8_t *vp = v + (size_t)(row >> 1) * v_stride;
+				uint8_t *out = dst + (size_t)row * width * 4;
+				for (uint32_t col = 0; col < width; col++) {
+					int Y = (int)yp[col];
+					int U = (int)up[col >> 1] - 128;
+					int V = (int)vp[col >> 1] - 128;
+					out[0] = clamp_u8(Y + ((359 * V) >> 8));
+					out[1] = clamp_u8(Y - ((88 * U + 183 * V) >> 8));
+					out[2] = clamp_u8(Y + ((454 * U) >> 8));
+					out[3] = 255;
+					out += 4;
+				}
+			}
+			s->pending_rgba_w = width;
+			s->pending_rgba_h = height;
+			s->has_new_rgba = true;
+		}
+		pthread_mutex_unlock(&s->lock);
+	}
+	pthread_mutex_unlock(&g_cam_registry_lock);
 }
 
 EXPORT void panggung_push_screen_rgba(const uint8_t *rgba, uint32_t stride,
 				      uint32_t width, uint32_t height, uint64_t timestamp_ns)
 {
-	UNUSED_PARAMETER(rgba); UNUSED_PARAMETER(stride);
-	UNUSED_PARAMETER(width); UNUSED_PARAMETER(height); UNUSED_PARAMETER(timestamp_ns);
+	UNUSED_PARAMETER(timestamp_ns);
+	pthread_mutex_lock(&g_screen_registry_lock);
+	if (g_screen_inst) {
+		submit_rgba_to_slot(g_screen_inst, rgba, stride, width, height);
+	}
+	pthread_mutex_unlock(&g_screen_registry_lock);
 }
 
 EXPORT void panggung_push_webview_rgba(const uint8_t *rgba, uint32_t stride,
@@ -850,5 +970,5 @@ EXPORT void panggung_register_android_plugins(void)
 	obs_register_source(&android_audio_in_info);
 	obs_register_source(&android_audio_out_info);
 	panggung_register_mediacodec_encoders();
-	blog(LOG_INFO, "[android-plugins] Registered zero-copy AHB android_camera (multi-cam), android_screen, android_webview, audio, GPU-surface mediacodec");
+	blog(LOG_INFO, "[android-plugins] Registered EGLSync-fenced AHB android_camera (multi-cam), android_screen (+CPU fallback), android_webview, audio, GPU-surface mediacodec");
 }
