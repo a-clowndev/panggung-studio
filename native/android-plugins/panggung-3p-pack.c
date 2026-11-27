@@ -13,6 +13,13 @@
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libavutil/opt.h>
+#include <libavutil/mathematics.h>
+#include <libavutil/channel_layout.h>
 
 OBS_DECLARE_MODULE()
 
@@ -718,6 +725,319 @@ DEFINE_AUX_SOURCE(dsksrc,  "panggung_downstream_keyer",  "Downstream Keyer")
 
 DEFINE_SHADER_FILTER(autofrm, "panggung_auto_framing",  "Digital PTZ / Framing", EFFECT_DIGITAL_PTZ, "zoom", 1.25f)
 
+/* ---------- In-Process Hardware-Encoded SRT / UDP MPEG-TS Output (v0.2.0-alpha.2) ---------- */
+struct panggung_srt_ctx {
+    obs_output_t *output;
+    char url[1024];
+    AVFormatContext *fmt;
+    AVStream *v_stream;
+    AVStream *a_stream;
+    pthread_t connect_thread;
+    bool thread_started;
+    bool capture_started;
+    atomic_bool stopping;
+    atomic_bool connected;
+    pthread_mutex_t write_mtx;
+    uint64_t total_bytes;
+    int dropped_frames;
+    int consecutive_errors;
+    float congestion;
+};
+
+static int srt_interrupt_cb(void *opaque) {
+    struct panggung_srt_ctx *c = opaque;
+    return atomic_load(&c->stopping) ? 1 : 0;
+}
+
+static void srt_redact_url(const char *src, char *dst, size_t dst_sz) {
+    if (!src || dst_sz == 0) return;
+    const char *q = strchr(src, '?');
+    if (!q) {
+        snprintf(dst, dst_sz, "%s", src);
+    } else {
+        size_t prefix = (size_t)(q - src);
+        if (prefix >= dst_sz - 12) prefix = dst_sz - 12;
+        memcpy(dst, src, prefix);
+        snprintf(dst + prefix, dst_sz - prefix, "?[redacted]");
+    }
+}
+
+static const char *srt_out_name(void *u) {
+    UNUSED_PARAMETER(u);
+    return "Panggung In-Process SRT/UDP Output";
+}
+
+static void *srt_out_create(obs_data_t *settings, obs_output_t *output) {
+    struct panggung_srt_ctx *c = bzalloc(sizeof(*c));
+    c->output = output;
+    const char *u = obs_data_get_string(settings, "url");
+    if (u && *u) snprintf(c->url, sizeof(c->url), "%s", u);
+    pthread_mutex_init(&c->write_mtx, NULL);
+    atomic_init(&c->stopping, false);
+    atomic_init(&c->connected, false);
+    return c;
+}
+
+static void srt_close_muxer_locked(struct panggung_srt_ctx *c) {
+    if (c->fmt) {
+        if (atomic_load(&c->connected) && c->fmt->pb) {
+            av_write_trailer(c->fmt);
+        }
+        if (c->fmt->pb) {
+            avio_closep(&c->fmt->pb);
+        }
+        avformat_free_context(c->fmt);
+        c->fmt = NULL;
+        c->v_stream = NULL;
+        c->a_stream = NULL;
+    }
+    atomic_store(&c->connected, false);
+}
+
+static void srt_out_destroy(void *d) {
+    struct panggung_srt_ctx *c = d;
+    atomic_store(&c->stopping, true);
+    if (c->thread_started) {
+        pthread_join(c->connect_thread, NULL);
+        c->thread_started = false;
+    }
+    pthread_mutex_lock(&c->write_mtx);
+    srt_close_muxer_locked(c);
+    pthread_mutex_unlock(&c->write_mtx);
+    pthread_mutex_destroy(&c->write_mtx);
+    bfree(c);
+}
+
+static void *srt_connect_worker(void *arg) {
+    struct panggung_srt_ctx *c = arg;
+    char safe_url[256];
+    srt_redact_url(c->url, safe_url, sizeof(safe_url));
+
+    AVFormatContext *fmt = NULL;
+    if (avformat_alloc_output_context2(&fmt, NULL, "mpegts", c->url) < 0 || !fmt) {
+        blog(LOG_ERROR, "[panggung-srt] Failed to alloc mpegts output context for %s", safe_url);
+        obs_output_signal_stop(c->output, OBS_OUTPUT_CONNECT_FAILED);
+        return NULL;
+    }
+    fmt->interrupt_callback.callback = srt_interrupt_cb;
+    fmt->interrupt_callback.opaque = c;
+
+    // 1. Video stream from OBS hardware/software encoder (MediaCodec H.264/HEVC or x264)
+    obs_encoder_t *v_enc = obs_output_get_video_encoder(c->output);
+    if (!v_enc) {
+        avformat_free_context(fmt);
+        obs_output_signal_stop(c->output, OBS_OUTPUT_ERROR);
+        return NULL;
+    }
+    AVStream *vs = avformat_new_stream(fmt, NULL);
+    const char *v_codec_name = obs_encoder_get_codec(v_enc);
+    bool is_hevc = v_codec_name && (strstr(v_codec_name, "hevc") || strstr(v_codec_name, "265"));
+    vs->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    vs->codecpar->codec_id = is_hevc ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264;
+    vs->codecpar->width = (int)obs_encoder_get_width(v_enc);
+    vs->codecpar->height = (int)obs_encoder_get_height(v_enc);
+    vs->time_base = (AVRational){ 1, 90000 };
+    uint8_t *v_extra = NULL;
+    size_t v_extra_sz = 0;
+    if (obs_encoder_get_extra_data(v_enc, &v_extra, &v_extra_sz) && v_extra && v_extra_sz > 0) {
+        vs->codecpar->extradata = av_mallocz(v_extra_sz + AV_INPUT_BUFFER_PADDING_SIZE);
+        if (vs->codecpar->extradata) {
+            memcpy(vs->codecpar->extradata, v_extra, v_extra_sz);
+            vs->codecpar->extradata_size = (int)v_extra_sz;
+        }
+    }
+
+    // 2. Audio stream from OBS AAC encoder
+    obs_encoder_t *a_enc = obs_output_get_audio_encoder(c->output, 0);
+    AVStream *as = NULL;
+    if (a_enc) {
+        as = avformat_new_stream(fmt, NULL);
+        as->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+        as->codecpar->codec_id = AV_CODEC_ID_AAC;
+        as->codecpar->sample_rate = (int)obs_encoder_get_sample_rate(a_enc);
+        av_channel_layout_default(&as->codecpar->ch_layout, 2);
+        as->time_base = (AVRational){ 1, as->codecpar->sample_rate > 0 ? as->codecpar->sample_rate : 48000 };
+        uint8_t *a_extra = NULL;
+        size_t a_extra_sz = 0;
+        if (obs_encoder_get_extra_data(a_enc, &a_extra, &a_extra_sz) && a_extra && a_extra_sz > 0) {
+            as->codecpar->extradata = av_mallocz(a_extra_sz + AV_INPUT_BUFFER_PADDING_SIZE);
+            if (as->codecpar->extradata) {
+                memcpy(as->codecpar->extradata, a_extra, a_extra_sz);
+                as->codecpar->extradata_size = (int)a_extra_sz;
+            }
+        }
+    }
+
+    blog(LOG_INFO, "[panggung-srt] Connecting in-process MPEG-TS (%s + aac) -> %s", is_hevc ? "hevc" : "h264", safe_url);
+    int ret = avio_open2(&fmt->pb, c->url, AVIO_FLAG_WRITE, &fmt->interrupt_callback, NULL);
+    if (ret < 0 || atomic_load(&c->stopping)) {
+        blog(LOG_WARNING, "[panggung-srt] avio_open2 failed (%d) for %s", ret, safe_url);
+        if (fmt->pb) avio_closep(&fmt->pb);
+        avformat_free_context(fmt);
+        if (!atomic_load(&c->stopping)) {
+            obs_output_signal_stop(c->output, OBS_OUTPUT_CONNECT_FAILED);
+        }
+        return NULL;
+    }
+
+    ret = avformat_write_header(fmt, NULL);
+    if (ret < 0 || atomic_load(&c->stopping)) {
+        blog(LOG_WARNING, "[panggung-srt] avformat_write_header failed (%d)", ret);
+        avio_closep(&fmt->pb);
+        avformat_free_context(fmt);
+        if (!atomic_load(&c->stopping)) {
+            obs_output_signal_stop(c->output, OBS_OUTPUT_CONNECT_FAILED);
+        }
+        return NULL;
+    }
+
+    pthread_mutex_lock(&c->write_mtx);
+    c->fmt = fmt;
+    c->v_stream = vs;
+    c->a_stream = as;
+    c->total_bytes = 0;
+    c->dropped_frames = 0;
+    c->consecutive_errors = 0;
+    c->congestion = 0.0f;
+    atomic_store(&c->connected, true);
+    pthread_mutex_unlock(&c->write_mtx);
+
+    c->capture_started = obs_output_begin_data_capture(c->output, 0);
+    if (!c->capture_started) {
+        blog(LOG_ERROR, "[panggung-srt] obs_output_begin_data_capture failed");
+        obs_output_signal_stop(c->output, OBS_OUTPUT_ERROR);
+    } else {
+        blog(LOG_INFO, "[panggung-srt] Connected & streaming LIVE -> %s", safe_url);
+    }
+    return NULL;
+}
+
+static bool srt_out_start(void *d) {
+    struct panggung_srt_ctx *c = d;
+    if (!c->url[0]) return false;
+    if (!obs_output_can_begin_data_capture(c->output, 0)) return false;
+    if (!obs_output_initialize_encoders(c->output, 0)) return false;
+
+    if (c->thread_started) {
+        atomic_store(&c->stopping, true);
+        pthread_join(c->connect_thread, NULL);
+        c->thread_started = false;
+    }
+    atomic_store(&c->stopping, false);
+    atomic_store(&c->connected, false);
+    c->capture_started = false;
+
+    if (pthread_create(&c->connect_thread, NULL, srt_connect_worker, c) != 0) {
+        return false;
+    }
+    c->thread_started = true;
+    return true;
+}
+
+static void srt_out_stop(void *d, uint64_t ts) {
+    UNUSED_PARAMETER(ts);
+    struct panggung_srt_ctx *c = d;
+    atomic_store(&c->stopping, true);
+    if (c->thread_started) {
+        pthread_join(c->connect_thread, NULL);
+        c->thread_started = false;
+    }
+    if (c->capture_started) {
+        obs_output_end_data_capture(c->output);
+        c->capture_started = false;
+    }
+    pthread_mutex_lock(&c->write_mtx);
+    srt_close_muxer_locked(c);
+    pthread_mutex_unlock(&c->write_mtx);
+}
+
+static void srt_out_encoded_packet(void *d, struct encoder_packet *pkt) {
+    struct panggung_srt_ctx *c = d;
+    if (!pkt || atomic_load(&c->stopping) || !atomic_load(&c->connected)) return;
+
+    pthread_mutex_lock(&c->write_mtx);
+    if (!c->fmt || !c->fmt->pb || atomic_load(&c->stopping)) {
+        pthread_mutex_unlock(&c->write_mtx);
+        return;
+    }
+
+    AVStream *st = (pkt->type == OBS_ENCODER_VIDEO) ? c->v_stream : c->a_stream;
+    if (!st) {
+        pthread_mutex_unlock(&c->write_mtx);
+        return;
+    }
+
+    AVPacket *avpkt = av_packet_alloc();
+    if (!avpkt) {
+        pthread_mutex_unlock(&c->write_mtx);
+        return;
+    }
+    if (av_new_packet(avpkt, (int)pkt->size) == 0) {
+        memcpy(avpkt->data, pkt->data, pkt->size);
+        AVRational src_tb = { pkt->timebase_num > 0 ? pkt->timebase_num : 1, pkt->timebase_den > 0 ? pkt->timebase_den : 1000 };
+        avpkt->pts = av_rescale_q(pkt->pts, src_tb, st->time_base);
+        avpkt->dts = av_rescale_q(pkt->dts, src_tb, st->time_base);
+        if (avpkt->dts > avpkt->pts) avpkt->dts = avpkt->pts;
+        avpkt->stream_index = st->index;
+        if (pkt->keyframe) avpkt->flags |= AV_PKT_FLAG_KEY;
+
+        uint64_t t0 = os_gettime_ns();
+        int ret = av_interleaved_write_frame(c->fmt, avpkt);
+        uint64_t elapsed_ms = (os_gettime_ns() - t0) / 1000000ULL;
+
+        if (ret < 0) {
+            c->dropped_frames++;
+            c->consecutive_errors++;
+            c->congestion = 1.0f;
+            if (c->consecutive_errors >= 3) {
+                atomic_store(&c->connected, false);
+                pthread_mutex_unlock(&c->write_mtx);
+                av_packet_free(&avpkt);
+                obs_output_signal_stop(c->output, OBS_OUTPUT_DISCONNECTED);
+                return;
+            }
+        } else {
+            c->consecutive_errors = 0;
+            c->total_bytes += pkt->size;
+            float sample = (elapsed_ms > 15) ? fminf(1.0f, (float)(elapsed_ms - 15) / 50.0f) : 0.0f;
+            c->congestion = c->congestion * 0.85f + sample * 0.15f;
+        }
+    }
+    av_packet_free(&avpkt);
+    pthread_mutex_unlock(&c->write_mtx);
+}
+
+static uint64_t srt_out_total_bytes(void *d) {
+    struct panggung_srt_ctx *c = d;
+    return c->total_bytes;
+}
+
+static int srt_out_dropped_frames(void *d) {
+    struct panggung_srt_ctx *c = d;
+    return c->dropped_frames;
+}
+
+static float srt_out_congestion(void *d) {
+    struct panggung_srt_ctx *c = d;
+    return c->congestion;
+}
+
+static struct obs_output_info panggung_srt_output_info = {
+    .id = "panggung_srt_output",
+    .flags = OBS_OUTPUT_AV | OBS_OUTPUT_ENCODED,
+    .encoded_video_codecs = "h264;hevc",
+    .encoded_audio_codecs = "aac",
+    .get_name = srt_out_name,
+    .create = srt_out_create,
+    .destroy = srt_out_destroy,
+    .start = srt_out_start,
+    .stop = srt_out_stop,
+    .encoded_packet = srt_out_encoded_packet,
+    .get_total_bytes = srt_out_total_bytes,
+    .get_dropped_frames = srt_out_dropped_frames,
+    .get_congestion = srt_out_congestion,
+};
+
 bool obs_module_load(void) {
     obs_register_source(&blur_info);
     obs_register_source(&retro_info);
@@ -741,6 +1061,7 @@ bool obs_module_load(void) {
     obs_register_source(&dsksrc_info);
     obs_register_source(&autofrm_info);
     obs_register_source(&dyndel_info);
-    blog(LOG_INFO, "[panggung-3p-pack] Registered 22 native 3P & AndroidPlus filters/sources!");
+    obs_register_output(&panggung_srt_output_info);
+    blog(LOG_INFO, "[panggung-3p-pack] Registered 22 native 3P/AndroidPlus sources+filters + panggung_srt_output!");
     return true;
 }

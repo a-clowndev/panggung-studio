@@ -32,6 +32,13 @@ class PanggungService : Service() {
         const val EXTRA_RESULT_DATA = "result_data"
         const val EXTRA_FGS_TYPE = "fgs_type"
         val networkGeneration = java.util.concurrent.atomic.AtomicLong(0L)
+        @Volatile
+        private var instance: PanggungService? = null
+
+        /** Bind PARTIAL_WAKE_LOCK strictly to active streaming/recording lifecycle. */
+        fun setBroadcastWakeLock(active: Boolean) {
+            instance?.updateWakeLock(active)
+        }
     }
 
     private val screenCapture = ScreenCapture()
@@ -39,41 +46,64 @@ class PanggungService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var netCallback: ConnectivityManager.NetworkCallback? = null
 
+    private fun updateWakeLock(active: Boolean) {
+        try {
+            if (active) {
+                if (wakeLock == null) {
+                    val pm = getSystemService(PowerManager::class.java)
+                    wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PanggungStudio::BroadcastWakeLock").apply {
+                        setReferenceCounted(false)
+                    }
+                }
+                if (wakeLock?.isHeld == false) {
+                    wakeLock?.acquire(6 * 60 * 60 * 1000L) // safety cap
+                    Log.i("PanggungService", "Broadcast WakeLock acquired")
+                }
+            } else {
+                wakeLock?.let {
+                    if (it.isHeld) {
+                        it.release()
+                        Log.i("PanggungService", "Broadcast WakeLock released")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("PanggungService", "WakeLock update failed: ${e.message}")
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
-        try {
-            val pm = getSystemService(PowerManager::class.java)
-            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PanggungStudio::BroadcastWakeLock").apply {
-                setReferenceCounted(false)
-                acquire(6 * 60 * 60 * 1000L) // up to 6h IRL broadcast safety cap
-            }
-        } catch (e: Exception) {
-            Log.w("PanggungService", "WakeLock unavailable: ${e.message}")
-        }
+        instance = this
         try {
             val cm = getSystemService(ConnectivityManager::class.java)
-            val req = NetworkRequest.Builder()
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                .build()
             val cb = object : ConnectivityManager.NetworkCallback() {
-                @Volatile private var sawInitialNetwork = false
+                @Volatile private var activeNetId: Long = -1L
                 override fun onAvailable(network: Network) {
-                    if (!sawInitialNetwork) {
-                        sawInitialNetwork = true
+                    val handle = network.networkHandle
+                    if (activeNetId == -1L) {
+                        activeNetId = handle
                         return
                     }
-                    val gen = networkGeneration.incrementAndGet()
-                    Log.i("PanggungService", "Network switched/recovered (gen=$gen)")
+                    if (handle != activeNetId) {
+                        activeNetId = handle
+                        val gen = networkGeneration.incrementAndGet()
+                        Log.i("PanggungService", "Default network switched (gen=$gen)")
+                    }
                 }
                 override fun onLost(network: Network) {
-                    val gen = networkGeneration.incrementAndGet()
-                    Log.w("PanggungService", "Active network lost (gen=$gen)")
+                    if (network.networkHandle == activeNetId) {
+                        activeNetId = -1L
+                        val gen = networkGeneration.incrementAndGet()
+                        Log.w("PanggungService", "Default network lost (gen=$gen)")
+                    }
                 }
             }
-            cm.registerNetworkCallback(req, cb)
+            // Monitor ONLY the app's default network so background secondary network churn never kills a healthy stream
+            cm.registerDefaultNetworkCallback(cb)
             netCallback = cb
         } catch (e: Exception) {
-            Log.w("PanggungService", "NetworkCallback unavailable: ${e.message}")
+            Log.w("PanggungService", "DefaultNetworkCallback unavailable: ${e.message}")
         }
     }
 
@@ -157,6 +187,7 @@ class PanggungService : Service() {
     }
 
     override fun onDestroy() {
+        instance = null
         screenCapture.stop()
         netCallback?.let {
             try { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) } catch (_: Exception) {}

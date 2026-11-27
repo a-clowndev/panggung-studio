@@ -167,6 +167,14 @@ class Camera2Capture(private val context: Context) {
                             val req = cam.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                                 addTarget(surface)
                                 set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                                // Enable hardware OIS (preferred, zero crop) or EIS fallback from frame #1
+                                if (supportsOis) {
+                                    set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
+                                    set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+                                } else if (supportsEis) {
+                                    set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF)
+                                    set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)
+                                }
                             }
                             activeReqBuilder = req
                             @Suppress("DEPRECATION")

@@ -123,6 +123,7 @@ data class SnapshotUi(
     val congestion: Float = 0f,
     val recording: Boolean = false,
     val streaming: Boolean = false,
+    val wantStreaming: Boolean = false,
     val replayActive: Boolean = false,
 )
 
@@ -545,7 +546,7 @@ class MainActivity : ComponentActivity() {
                             },
                             onCheckUpdates = {
                                 coroutineScope.launch {
-                                    val curVer = try { packageManager.getPackageInfo(packageName, 0).versionName ?: "0.2.0-alpha.1" } catch (_: Exception) { "0.2.0-alpha.1" }
+                                    val curVer = try { packageManager.getPackageInfo(packageName, 0).versionName ?: "0.2.0-alpha.2" } catch (_: Exception) { "0.2.0-alpha.2" }
                                     statusBanner = ThermalGovernor.checkLatestRelease(curVer)
                                 }
                             },
@@ -709,7 +710,7 @@ class MainActivity : ComponentActivity() {
                                         ThermalGovernor.setKeepScreenOn(this@MainActivity, enabled)
                                     },
                                     onCheckUpdates = {
-                                        val curVer = try { packageManager.getPackageInfo(packageName, 0).versionName ?: "0.2.0-alpha.1" } catch (_: Exception) { "0.2.0-alpha.1" }
+                                        val curVer = try { packageManager.getPackageInfo(packageName, 0).versionName ?: "0.2.0-alpha.2" } catch (_: Exception) { "0.2.0-alpha.2" }
                                         coroutineScope.launch { statusBanner = ThermalGovernor.checkLatestRelease(curVer) }
                                     },
                                     onToggleDualCanvas = {
@@ -740,9 +741,11 @@ class MainActivity : ComponentActivity() {
                     isStreaming = snapshot.streaming || wantStreaming,
                     isRecording = snapshot.recording,
                     onConfirm = {
+                        val wasStreaming = snapshot.streaming || wantStreaming
                         wantStreaming = false
-                        if (snapshot.streaming) NativeBridge.nativeStopStreaming()
+                        if (wasStreaming) NativeBridge.nativeStopStreaming()
                         if (snapshot.recording) NativeBridge.nativeStopRecording()
+                        PanggungService.setBroadcastWakeLock(false)
                         recPaused = false
                         statusBanner = "Broadcast stopped cleanly"
                         showConfirmStop = false
@@ -813,7 +816,7 @@ class MainActivity : ComponentActivity() {
             if (showLogs) {
                 LogViewerDialog(
                     crashLog = NativeBridge.nativeGetLastCrashLog(),
-                    statusLog = "Panggung Engine v0.2.0-alpha.1 | ${snapshot.baseWidth}x${snapshot.baseHeight} | FPS=${snapshot.fps}\n$statusBanner",
+                    statusLog = "Panggung Engine v0.2.0-alpha.2 | ${snapshot.baseWidth}x${snapshot.baseHeight} | FPS=${snapshot.fps}\n$statusBanner",
                     onDismiss = { showLogs = false },
                 )
             }
@@ -1619,8 +1622,14 @@ class MainActivity : ComponentActivity() {
                 congestion = o.optDouble("congestion", 0.0).toFloat(),
                 recording = o.optBoolean("recording", false),
                 streaming = o.optBoolean("streaming", false),
+                wantStreaming = o.optBoolean("want_streaming", false),
                 replayActive = o.optBoolean("replay_active", false),
             )
+            // Single authoritative session state from Rust core: remote StopStream cancels Kotlin auto-reconnect immediately!
+            if (wantStreaming && !snapshot.wantStreaming) {
+                wantStreaming = false
+            }
+            PanggungService.setBroadcastWakeLock(snapshot.streaming || snapshot.recording || snapshot.wantStreaming)
         } catch (_: Exception) {}
     }
 

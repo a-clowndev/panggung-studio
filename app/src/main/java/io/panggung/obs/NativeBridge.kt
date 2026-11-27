@@ -106,6 +106,7 @@ object NativeBridge {
     external fun nativeFlipSource(name: String, horizontal: Boolean): Boolean
     external fun nativeResetSourceTransform(name: String): Boolean
     external fun nativeUpdateLiveBitrate(bitrateKbps: Int): Boolean
+    external fun nativeUpdateStreamBitrate(bitrateKbps: Int): Boolean
 
     // Hardened Remote Control (disabled by default; opt-in with mandatory SHA-256 auth)
     external fun nativeSetRemoteControl(enabled: Boolean, lanAccess: Boolean, authToken: String): Boolean

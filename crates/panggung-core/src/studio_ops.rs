@@ -228,7 +228,8 @@ pub(crate) fn ws_reset_source_transform(name: &str) -> bool {
 }
 
 /// Dynamic bitrate adjustment via obs_encoder_update without dropping active stream/recording (T-C02 / T-E01).
-pub(crate) fn ws_update_live_bitrate(bitrate_kbps: i64) -> bool {
+/// When `include_recording` is false (network congestion ABR), ONLY streaming bitrate is adjusted so local recording quality stays untouched.
+pub(crate) fn ws_update_live_bitrate_ex(bitrate_kbps: i64, include_recording: bool) -> bool {
     let guard = STATE.lock().unwrap();
     let Some(state) = guard.as_ref() else { return false; };
     let mut updated = false;
@@ -250,11 +251,15 @@ pub(crate) fn ws_update_live_bitrate(bitrate_kbps: i64) -> bool {
         false
     };
     if apply(&state.streaming) { updated = true; }
-    if apply(&state.recording) { updated = true; }
+    if include_recording && apply(&state.recording) { updated = true; }
     if updated {
-        info!("Dynamic live bitrate updated to {} kbps", bitrate_kbps);
+        info!("Dynamic live bitrate updated to {} kbps (include_recording={})", bitrate_kbps, include_recording);
     }
     updated
+}
+
+pub(crate) fn ws_update_live_bitrate(bitrate_kbps: i64) -> bool {
+    ws_update_live_bitrate_ex(bitrate_kbps, true)
 }
 
 /* ---- JNI Exports for Fase A (T-A03 & T-A04) ---- */
@@ -373,4 +378,11 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeUpdateLiveBitrate
     _env: JNIEnv, _class: JClass, bitrate_kbps: jint,
 ) -> jboolean {
     if ws_update_live_bitrate(bitrate_kbps as i64) { JNI_TRUE } else { JNI_FALSE }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeUpdateStreamBitrate(
+    _env: JNIEnv, _class: JClass, bitrate_kbps: jint,
+) -> jboolean {
+    if ws_update_live_bitrate_ex(bitrate_kbps as i64, false) { JNI_TRUE } else { JNI_FALSE }
 }

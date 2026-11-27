@@ -86,7 +86,13 @@ object ThermalGovernor {
         }
         val targetBitrate = (baseBitrateKbps * combinedScale).toInt().coerceAtLeast(600)
         if (outputActive && targetBitrate != lastAppliedBitrate) {
-            if (NativeBridge.nativeUpdateLiveBitrate(targetBitrate)) {
+            val applied = if (reason == "CONGESTION") {
+                // Network congestion ABR ONLY scales streaming bitrate — never degrades local recording quality
+                NativeBridge.nativeUpdateStreamBitrate(targetBitrate)
+            } else {
+                NativeBridge.nativeUpdateLiveBitrate(targetBitrate)
+            }
+            if (applied) {
                 lastAppliedBitrate = targetBitrate
             }
         }
@@ -109,22 +115,43 @@ object ThermalGovernor {
         }
     }
 
-    private fun parseSemVer(raw: String): Triple<Int, Int, Int> {
-        val clean = raw.trim().removePrefix("v").removePrefix("V").substringBefore("-")
-        val parts = clean.split(".")
-        return Triple(
-            parts.getOrNull(0)?.toIntOrNull() ?: 0,
-            parts.getOrNull(1)?.toIntOrNull() ?: 0,
-            parts.getOrNull(2)?.toIntOrNull() ?: 0,
+    private data class SemVer(val maj: Int, val min: Int, val pat: Int, val pre: String)
+
+    private fun parseSemVer(raw: String): SemVer {
+        val trimmed = raw.trim().removePrefix("v").removePrefix("V")
+        val core = trimmed.substringBefore("-")
+        val pre = if (trimmed.contains("-")) trimmed.substringAfter("-") else ""
+        val parts = core.split(".")
+        return SemVer(
+            maj = parts.getOrNull(0)?.toIntOrNull() ?: 0,
+            min = parts.getOrNull(1)?.toIntOrNull() ?: 0,
+            pat = parts.getOrNull(2)?.toIntOrNull() ?: 0,
+            pre = pre,
         )
     }
 
+    /** SemVer 2.0.0 compliant comparison (stable 0.2.0 > 0.2.0-rc.1 > 0.2.0-beta.1 > 0.2.0-alpha.2 > 0.2.0-alpha.1). */
     internal fun isNewerVersion(remoteTag: String, currentVersion: String): Boolean {
-        val (rMaj, rMin, rPat) = parseSemVer(remoteTag)
-        val (cMaj, cMin, cPat) = parseSemVer(currentVersion)
-        if (rMaj != cMaj) return rMaj > cMaj
-        if (rMin != cMin) return rMin > cMin
-        return rPat > cPat
+        val r = parseSemVer(remoteTag)
+        val c = parseSemVer(currentVersion)
+        if (r.maj != c.maj) return r.maj > c.maj
+        if (r.min != c.min) return r.min > c.min
+        if (r.pat != c.pat) return r.pat > c.pat
+        if (r.pre == c.pre) return false
+        if (r.pre.isEmpty()) return true // stable > prerelease
+        if (c.pre.isEmpty()) return false // prerelease < stable
+        val rParts = r.pre.split(".")
+        val cParts = c.pre.split(".")
+        val len = maxOf(rParts.size, cParts.size)
+        for (i in 0 until len) {
+            val rp = rParts.getOrNull(i) ?: return false
+            val cp = cParts.getOrNull(i) ?: return true
+            val ri = rp.toIntOrNull()
+            val ci = cp.toIntOrNull()
+            val cmp = if (ri != null && ci != null) ri.compareTo(ci) else rp.compareTo(cp)
+            if (cmp != 0) return cmp > 0
+        }
+        return false
     }
 
     /**

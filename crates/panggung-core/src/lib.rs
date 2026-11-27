@@ -986,6 +986,7 @@ pub(crate) struct StudioSnapshot {
     pub congestion: f32,
     pub recording: bool,
     pub streaming: bool,
+    pub want_streaming: bool,
     pub replay_active: bool,
 }
 
@@ -998,7 +999,7 @@ pub(crate) fn ws_get_snapshot() -> StudioSnapshot {
             base_width: 1280, base_height: 720, sources: vec![],
             fps: 0.0, frame_time_ms: 0.0, total_frames: 0, lagged_frames: 0,
             dropped_frames: 0, output_bytes: 0, congestion: 0.0,
-            recording: false, streaming: false, replay_active: false,
+            recording: false, streaming: false, want_streaming: false, replay_active: false,
         };
     };
     let idx = if state.studio_mode { state.preview_scene_idx } else { state.active_scene_idx };
@@ -1061,6 +1062,7 @@ pub(crate) fn ws_get_snapshot() -> StudioSnapshot {
         congestion,
         recording: state.recording.as_ref().map(|r| unsafe { sys::obs_output_active(r.output) }).unwrap_or(false),
         streaming: state.streaming.as_ref().map(|s| unsafe { sys::obs_output_active(s.output) }).unwrap_or(false),
+        want_streaming: WANT_STREAMING.load(std::sync::atomic::Ordering::SeqCst),
         replay_active: state.replay.as_ref().map(|r| unsafe { sys::obs_output_active(r.output) }).unwrap_or(false),
     }
 }
@@ -2104,6 +2106,14 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeStopRecording(_en
 }
 
 static WS_STREAM_CFG: Mutex<Option<(String, String, i64)>> = Mutex::new(None);
+static WANT_STREAMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn redact_url_for_log(url: &str) -> String {
+    match url.find('?') {
+        Some(idx) => format!("{}?[redacted]", &url[..idx]),
+        None => url.to_string(),
+    }
+}
 
 pub(crate) fn ws_set_stream_service_settings(server: &str, key: &str, bitrate_kbps: i64) {
     if let Ok(mut g) = WS_STREAM_CFG.lock() {
@@ -2127,6 +2137,7 @@ pub(crate) fn ws_start_stream() -> bool {
 }
 
 pub(crate) fn ws_stop_stream() -> bool {
+    WANT_STREAMING.store(false, std::sync::atomic::Ordering::SeqCst);
     let mut guard = STATE.lock().unwrap();
     if let Some(state) = guard.as_mut() {
         if let Some(st) = state.streaming.take() {
@@ -2170,11 +2181,13 @@ fn start_streaming_internal(url: &str, key: &str, bitrate_kbps: i64) -> bool {
     let enc_id = state.video_encoder_id.clone();
     let lower_url = url.trim().to_ascii_lowercase();
     let is_srt_or_udp = lower_url.starts_with("srt://") || lower_url.starts_with("udp://");
+    let safe_url = redact_url_for_log(url.trim());
     unsafe {
+        let Some((v_enc, a_enc)) = create_av_encoders(&enc_id, bitrate_kbps) else { return false; };
         if is_srt_or_udp {
-            // First-class in-process SRT / MPEG-TS streaming via obs-ffmpeg's `ffmpeg_output`
-            // (uses our compiled libavformat.so + libsrt v1.5.4 + mbedTLS directly in-process,
-            // avoiding desktop `ffmpeg_mpegts_muxer` which tries to fork/exec `obs-ffmpeg-mux`).
+            // First-class in-process Hardware-Encoded SRT / UDP MPEG-TS streaming via `panggung_srt_output`
+            // Uses OBS's selected hardware MediaCodec H.264/HEVC (or x264) + AAC encoders,
+            // supports live ABR bitrate updates via obs_encoder_update() AND real congestion metrics!
             let mut full_url = if !key.trim().is_empty() && !url.contains("streamid=") {
                 let sep = if url.contains('?') { "&" } else { "?" };
                 format!("{url}{sep}streamid={}", key.trim())
@@ -2186,32 +2199,37 @@ fn start_streaming_internal(url: &str, key: &str, bitrate_kbps: i64) -> bool {
                 full_url.push_str(&format!("{sep}connect_timeout=3000"));
             }
             let Ok(mut out_data) = ObsData::new() else {
+                sys::obs_encoder_release(v_enc);
+                sys::obs_encoder_release(a_enc);
                 return false;
             };
             let _ = out_data.set_string("url", &full_url);
-            let _ = out_data.set_string("format_name", "mpegts");
-            let _ = out_data.set_string("video_encoder", "libx264");
-            let _ = out_data.set_string("audio_encoder", "aac");
-            let _ = out_data.set_int("video_bitrate", bitrate_kbps);
-            let _ = out_data.set_int("audio_bitrate", 128);
-            let _ = out_data.set_int("gop_size", 60);
-            let _ = out_data.set_string("video_settings", "preset=ultrafast tune=zerolatency");
-            let out_id = CString::new("ffmpeg_output").unwrap();
+            let out_id = CString::new("panggung_srt_output").unwrap();
             let out_name = CString::new("SRT Stream").unwrap();
             let output = sys::obs_output_create(out_id.as_ptr(), out_name.as_ptr(), out_data.as_ptr(), ptr::null_mut());
             if output.is_null() {
+                sys::obs_encoder_release(v_enc);
+                sys::obs_encoder_release(a_enc);
                 return false;
             }
+            sys::obs_output_set_video_encoder(output, v_enc);
+            sys::obs_output_set_audio_encoder(output, a_enc, 0);
             if !sys::obs_output_start(output) {
                 sys::obs_output_release(output);
+                sys::obs_encoder_release(v_enc);
+                sys::obs_encoder_release(a_enc);
                 return false;
             }
-            info!("SRT/MPEG-TS in-process stream started (ffmpeg_output) -> {url}");
-            state.streaming = Some(OutputBundle { output, v_enc: ptr::null_mut(), a_enc: ptr::null_mut(), service: ptr::null_mut() });
+            WANT_STREAMING.store(true, std::sync::atomic::Ordering::SeqCst);
+            info!("SRT/MPEG-TS in-process stream started ({enc_id}) -> {safe_url}");
+            state.streaming = Some(OutputBundle { output, v_enc, a_enc, service: ptr::null_mut() });
             return true;
         }
-        let Some((v_enc, a_enc)) = create_av_encoders(&enc_id, bitrate_kbps) else { return false; };
-        let Ok(mut svc_data) = ObsData::new() else { return false; };
+        let Ok(mut svc_data) = ObsData::new() else {
+            sys::obs_encoder_release(v_enc);
+            sys::obs_encoder_release(a_enc);
+            return false;
+        };
         let _ = svc_data.set_string("server", url);
         let _ = svc_data.set_string("key", key);
         let svc_id = CString::new("rtmp_custom").unwrap();
@@ -2241,7 +2259,8 @@ fn start_streaming_internal(url: &str, key: &str, bitrate_kbps: i64) -> bool {
             sys::obs_encoder_release(a_enc);
             return false;
         }
-        info!("RTMP stream started ({enc_id}) -> {url}");
+        WANT_STREAMING.store(true, std::sync::atomic::Ordering::SeqCst);
+        info!("RTMP/RTMPS stream started ({enc_id}) -> {safe_url}");
         state.streaming = Some(OutputBundle { output, v_enc, a_enc, service });
     }
     true
@@ -2259,6 +2278,7 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeStartStreaming(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeStopStreaming(_env: JNIEnv, _class: JClass) {
+    WANT_STREAMING.store(false, std::sync::atomic::Ordering::SeqCst);
     let mut guard = STATE.lock().unwrap();
     if let Some(state) = guard.as_mut() {
         if let Some(st) = state.streaming.take() {
@@ -2363,6 +2383,7 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeRenameSource(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeShutdown(_env: JNIEnv, _class: JClass) {
+    WANT_STREAMING.store(false, std::sync::atomic::Ordering::SeqCst);
     ws_server::stop_obs_websocket_server();
     web_remote::stop_web_remote_server();
     let mut guard = STATE.lock().unwrap();
