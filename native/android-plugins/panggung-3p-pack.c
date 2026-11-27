@@ -725,23 +725,35 @@ DEFINE_AUX_SOURCE(dsksrc,  "panggung_downstream_keyer",  "Downstream Keyer")
 
 DEFINE_SHADER_FILTER(autofrm, "panggung_auto_framing",  "Digital PTZ / Framing", EFFECT_DIGITAL_PTZ, "zoom", 1.25f)
 
-/* ---------- In-Process Hardware-Encoded SRT / UDP MPEG-TS Output (v0.2.0-alpha.2) ---------- */
+/* ---------- In-Process Hardware-Encoded SRT / UDP MPEG-TS Output (v0.2.0-alpha.2 Hardened) ---------- */
+#define SRT_QUEUE_CAP 128
+
 struct panggung_srt_ctx {
     obs_output_t *output;
     char url[1024];
     AVFormatContext *fmt;
     AVStream *v_stream;
     AVStream *a_stream;
-    pthread_t connect_thread;
+
+    // Dedicated connect + writer thread (never blocks OBS encoded_packet callback!)
+    pthread_t worker_thread;
     bool thread_started;
     bool capture_started;
     atomic_bool stopping;
     atomic_bool connected;
-    pthread_mutex_t write_mtx;
-    uint64_t total_bytes;
-    int dropped_frames;
-    int consecutive_errors;
-    float congestion;
+
+    // Bounded FIFO packet queue (OBS encoder -> writer thread)
+    pthread_mutex_t q_mtx;
+    pthread_cond_t q_cond;
+    AVPacket *queue[SRT_QUEUE_CAP];
+    int q_head;
+    int q_tail;
+    int q_count;
+
+    // Lock-free atomic stats for cross-thread OBS/ABR polling (zero data race)
+    atomic_uint_least64_t total_bytes;
+    atomic_int dropped_frames;
+    atomic_int congestion_milli; // 0..1000 -> 0.0f..1.0f
 };
 
 static int srt_interrupt_cb(void *opaque) {
@@ -751,34 +763,76 @@ static int srt_interrupt_cb(void *opaque) {
 
 static void srt_redact_url(const char *src, char *dst, size_t dst_sz) {
     if (!src || dst_sz == 0) return;
+    // Strip userinfo (user:pass@) and query parameters (?passphrase=...&streamid=...)
+    const char *scheme_end = strstr(src, "://");
+    const char *host_start = scheme_end ? (scheme_end + 3) : src;
     const char *q = strchr(src, '?');
-    if (!q) {
-        snprintf(dst, dst_sz, "%s", src);
-    } else {
+    const char *at = strchr(host_start, '@');
+    if (at && (!q || at < q)) {
+        size_t scheme_len = scheme_end ? (size_t)(host_start - src) : 0;
+        const char *after_at = at + 1;
+        size_t host_len = q ? (size_t)(q - after_at) : strlen(after_at);
+        if (scheme_len + 12 + host_len + 14 >= dst_sz) {
+            snprintf(dst, dst_sz, "%.*s[redacted]", (int)scheme_len, src);
+        } else {
+            snprintf(dst, dst_sz, "%.*s[redacted]@%.*s%s",
+                     (int)scheme_len, src, (int)host_len, after_at, q ? "?[redacted]" : "");
+        }
+    } else if (q) {
         size_t prefix = (size_t)(q - src);
-        if (prefix >= dst_sz - 12) prefix = dst_sz - 12;
-        memcpy(dst, src, prefix);
-        snprintf(dst + prefix, dst_sz - prefix, "?[redacted]");
+        if (prefix >= dst_sz - 14) prefix = dst_sz - 14;
+        snprintf(dst, dst_sz, "%.*s?[redacted]", (int)prefix, src);
+    } else {
+        snprintf(dst, dst_sz, "%s", src);
     }
 }
 
-static const char *srt_out_name(void *u) {
-    UNUSED_PARAMETER(u);
-    return "Panggung In-Process SRT/UDP Output";
+/* Extract sensitive query param `passphrase=` into AVDictionary so FFmpeg's own av_log never prints it. */
+static void srt_extract_passphrase(const char *raw_url, char *clean_url, size_t clean_sz, AVDictionary **opts) {
+    const char *q = strchr(raw_url, '?');
+    if (!q) {
+        snprintf(clean_url, clean_sz, "%s", raw_url);
+        return;
+    }
+    size_t base_len = (size_t)(q - raw_url);
+    if (base_len >= clean_sz) base_len = clean_sz - 1;
+    memcpy(clean_url, raw_url, base_len);
+    clean_url[base_len] = '\0';
+
+    char query_copy[1024];
+    snprintf(query_copy, sizeof(query_copy), "%s", q + 1);
+    bool first = true;
+    char *saveptr = NULL;
+    for (char *tok = strtok_r(query_copy, "&", &saveptr); tok != NULL; tok = strtok_r(NULL, "&", &saveptr)) {
+        if (strncmp(tok, "passphrase=", 11) == 0) {
+            if (tok[11] != '\0') {
+                av_dict_set(opts, "passphrase", tok + 11, 0);
+            }
+            continue;
+        }
+        size_t cur = strlen(clean_url);
+        if (cur + strlen(tok) + 2 < clean_sz) {
+            clean_url[cur] = first ? '?' : '&';
+            clean_url[cur + 1] = '\0';
+            strcat(clean_url, tok);
+            first = false;
+        }
+    }
 }
 
-static void *srt_out_create(obs_data_t *settings, obs_output_t *output) {
-    struct panggung_srt_ctx *c = bzalloc(sizeof(*c));
-    c->output = output;
-    const char *u = obs_data_get_string(settings, "url");
-    if (u && *u) snprintf(c->url, sizeof(c->url), "%s", u);
-    pthread_mutex_init(&c->write_mtx, NULL);
-    atomic_init(&c->stopping, false);
-    atomic_init(&c->connected, false);
-    return c;
+static void srt_drain_queue_locked(struct panggung_srt_ctx *c) {
+    while (c->q_count > 0) {
+        AVPacket *p = c->queue[c->q_head];
+        c->queue[c->q_head] = NULL;
+        c->q_head = (c->q_head + 1) % SRT_QUEUE_CAP;
+        c->q_count--;
+        if (p) av_packet_free(&p);
+    }
+    c->q_head = 0;
+    c->q_tail = 0;
 }
 
-static void srt_close_muxer_locked(struct panggung_srt_ctx *c) {
+static void srt_close_muxer(struct panggung_srt_ctx *c) {
     if (c->fmt) {
         if (atomic_load(&c->connected) && c->fmt->pb) {
             av_write_trailer(c->fmt);
@@ -794,27 +848,76 @@ static void srt_close_muxer_locked(struct panggung_srt_ctx *c) {
     atomic_store(&c->connected, false);
 }
 
+static const char *srt_out_name(void *u) {
+    UNUSED_PARAMETER(u);
+    return "Panggung In-Process SRT/UDP Output";
+}
+
+static void *srt_out_create(obs_data_t *settings, obs_output_t *output) {
+    struct panggung_srt_ctx *c = bzalloc(sizeof(*c));
+    c->output = output;
+    const char *u = obs_data_get_string(settings, "url");
+    if (u && *u) snprintf(c->url, sizeof(c->url), "%s", u);
+    pthread_mutex_init(&c->q_mtx, NULL);
+    pthread_cond_init(&c->q_cond, NULL);
+    atomic_init(&c->stopping, false);
+    atomic_init(&c->connected, false);
+    atomic_init(&c->total_bytes, 0);
+    atomic_init(&c->dropped_frames, 0);
+    atomic_init(&c->congestion_milli, 0);
+    return c;
+}
+
 static void srt_out_destroy(void *d) {
     struct panggung_srt_ctx *c = d;
     atomic_store(&c->stopping, true);
+    pthread_mutex_lock(&c->q_mtx);
+    pthread_cond_broadcast(&c->q_cond);
+    pthread_mutex_unlock(&c->q_mtx);
     if (c->thread_started) {
-        pthread_join(c->connect_thread, NULL);
+        pthread_join(c->worker_thread, NULL);
         c->thread_started = false;
     }
-    pthread_mutex_lock(&c->write_mtx);
-    srt_close_muxer_locked(c);
-    pthread_mutex_unlock(&c->write_mtx);
-    pthread_mutex_destroy(&c->write_mtx);
+    srt_close_muxer(c);
+    pthread_mutex_lock(&c->q_mtx);
+    srt_drain_queue_locked(c);
+    pthread_mutex_unlock(&c->q_mtx);
+    pthread_cond_destroy(&c->q_cond);
+    pthread_mutex_destroy(&c->q_mtx);
     bfree(c);
 }
 
-static void *srt_connect_worker(void *arg) {
+static void *srt_io_worker(void *arg) {
     struct panggung_srt_ctx *c = arg;
     char safe_url[256];
     srt_redact_url(c->url, safe_url, sizeof(safe_url));
 
+    // Strict codec validation: H.264 & HEVC only (reject AV1/VP9 cleanly)
+    obs_encoder_t *v_enc = obs_output_get_video_encoder(c->output);
+    if (!v_enc) {
+        obs_output_signal_stop(c->output, OBS_OUTPUT_ERROR);
+        return NULL;
+    }
+    const char *v_codec_name = obs_encoder_get_codec(v_enc);
+    enum AVCodecID v_codec_id = AV_CODEC_ID_NONE;
+    if (v_codec_name && (strcmp(v_codec_name, "h264") == 0 || strstr(v_codec_name, "264") != NULL)) {
+        v_codec_id = AV_CODEC_ID_H264;
+    } else if (v_codec_name && (strcmp(v_codec_name, "hevc") == 0 || strstr(v_codec_name, "265") != NULL)) {
+        v_codec_id = AV_CODEC_ID_HEVC;
+    } else {
+        blog(LOG_ERROR, "[panggung-srt] Unsupported video codec '%s' for MPEG-TS/SRT (only h264/hevc supported)",
+             v_codec_name ? v_codec_name : "null");
+        obs_output_signal_stop(c->output, OBS_OUTPUT_UNSUPPORTED);
+        return NULL;
+    }
+
+    char clean_url[1024];
+    AVDictionary *io_opts = NULL;
+    srt_extract_passphrase(c->url, clean_url, sizeof(clean_url), &io_opts);
+
     AVFormatContext *fmt = NULL;
-    if (avformat_alloc_output_context2(&fmt, NULL, "mpegts", c->url) < 0 || !fmt) {
+    if (avformat_alloc_output_context2(&fmt, NULL, "mpegts", clean_url) < 0 || !fmt) {
+        av_dict_free(&io_opts);
         blog(LOG_ERROR, "[panggung-srt] Failed to alloc mpegts output context for %s", safe_url);
         obs_output_signal_stop(c->output, OBS_OUTPUT_CONNECT_FAILED);
         return NULL;
@@ -822,18 +925,9 @@ static void *srt_connect_worker(void *arg) {
     fmt->interrupt_callback.callback = srt_interrupt_cb;
     fmt->interrupt_callback.opaque = c;
 
-    // 1. Video stream from OBS hardware/software encoder (MediaCodec H.264/HEVC or x264)
-    obs_encoder_t *v_enc = obs_output_get_video_encoder(c->output);
-    if (!v_enc) {
-        avformat_free_context(fmt);
-        obs_output_signal_stop(c->output, OBS_OUTPUT_ERROR);
-        return NULL;
-    }
     AVStream *vs = avformat_new_stream(fmt, NULL);
-    const char *v_codec_name = obs_encoder_get_codec(v_enc);
-    bool is_hevc = v_codec_name && (strstr(v_codec_name, "hevc") || strstr(v_codec_name, "265"));
     vs->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
-    vs->codecpar->codec_id = is_hevc ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264;
+    vs->codecpar->codec_id = v_codec_id;
     vs->codecpar->width = (int)obs_encoder_get_width(v_enc);
     vs->codecpar->height = (int)obs_encoder_get_height(v_enc);
     vs->time_base = (AVRational){ 1, 90000 };
@@ -847,7 +941,6 @@ static void *srt_connect_worker(void *arg) {
         }
     }
 
-    // 2. Audio stream from OBS AAC encoder
     obs_encoder_t *a_enc = obs_output_get_audio_encoder(c->output, 0);
     AVStream *as = NULL;
     if (a_enc) {
@@ -868,8 +961,10 @@ static void *srt_connect_worker(void *arg) {
         }
     }
 
-    blog(LOG_INFO, "[panggung-srt] Connecting in-process MPEG-TS (%s + aac) -> %s", is_hevc ? "hevc" : "h264", safe_url);
-    int ret = avio_open2(&fmt->pb, c->url, AVIO_FLAG_WRITE, &fmt->interrupt_callback, NULL);
+    blog(LOG_INFO, "[panggung-srt] Connecting in-process MPEG-TS (%s + aac) -> %s",
+         v_codec_id == AV_CODEC_ID_HEVC ? "hevc" : "h264", safe_url);
+    int ret = avio_open2(&fmt->pb, clean_url, AVIO_FLAG_WRITE, &fmt->interrupt_callback, &io_opts);
+    av_dict_free(&io_opts);
     if (ret < 0 || atomic_load(&c->stopping)) {
         blog(LOG_WARNING, "[panggung-srt] avio_open2 failed (%d) for %s", ret, safe_url);
         if (fmt->pb) avio_closep(&fmt->pb);
@@ -891,43 +986,110 @@ static void *srt_connect_worker(void *arg) {
         return NULL;
     }
 
-    pthread_mutex_lock(&c->write_mtx);
     c->fmt = fmt;
     c->v_stream = vs;
     c->a_stream = as;
-    c->total_bytes = 0;
-    c->dropped_frames = 0;
-    c->consecutive_errors = 0;
-    c->congestion = 0.0f;
+    atomic_store(&c->total_bytes, 0);
+    atomic_store(&c->dropped_frames, 0);
+    atomic_store(&c->congestion_milli, 0);
     atomic_store(&c->connected, true);
-    pthread_mutex_unlock(&c->write_mtx);
 
     c->capture_started = obs_output_begin_data_capture(c->output, 0);
     if (!c->capture_started) {
         blog(LOG_ERROR, "[panggung-srt] obs_output_begin_data_capture failed");
+        srt_close_muxer(c);
         obs_output_signal_stop(c->output, OBS_OUTPUT_ERROR);
-    } else {
-        blog(LOG_INFO, "[panggung-srt] Connected & streaming LIVE -> %s", safe_url);
+        return NULL;
     }
+    blog(LOG_INFO, "[panggung-srt] Connected & streaming LIVE (dedicated writer thread) -> %s", safe_url);
+
+    // Dedicated writer loop: drains bounded FIFO queue -> av_interleaved_write_frame
+    int consecutive_errors = 0;
+    while (!atomic_load(&c->stopping)) {
+        pthread_mutex_lock(&c->q_mtx);
+        while (c->q_count == 0 && !atomic_load(&c->stopping)) {
+            pthread_cond_wait(&c->q_cond, &c->q_mtx);
+        }
+        if (atomic_load(&c->stopping)) {
+            pthread_mutex_unlock(&c->q_mtx);
+            break;
+        }
+        AVPacket *pkt = c->queue[c->q_head];
+        c->queue[c->q_head] = NULL;
+        c->q_head = (c->q_head + 1) % SRT_QUEUE_CAP;
+        c->q_count--;
+        int q_depth = c->q_count;
+        pthread_mutex_unlock(&c->q_mtx);
+
+        if (!pkt) continue;
+        int pkt_sz = pkt->size;
+        uint64_t t0 = os_gettime_ns();
+        int wret = av_interleaved_write_frame(c->fmt, pkt);
+        uint64_t elapsed_ms = (os_gettime_ns() - t0) / 1000000ULL;
+        av_packet_free(&pkt);
+
+        if (wret < 0) {
+            atomic_fetch_add(&c->dropped_frames, 1);
+            consecutive_errors++;
+            atomic_store(&c->congestion_milli, 1000);
+            if (consecutive_errors >= 3) {
+                atomic_store(&c->connected, false);
+                obs_output_signal_stop(c->output, OBS_OUTPUT_DISCONNECTED);
+                break;
+            }
+        } else {
+            consecutive_errors = 0;
+            atomic_fetch_add(&c->total_bytes, (uint64_t)pkt_sz);
+            // Combine real queue fill ratio + write latency into congestion [0..1000]
+            float q_ratio = (float)q_depth / (float)SRT_QUEUE_CAP;
+            float lat_ratio = (elapsed_ms > 15) ? fminf(1.0f, (float)(elapsed_ms - 15) / 50.0f) : 0.0f;
+            float sample = fmaxf(q_ratio, lat_ratio);
+            float prev = (float)atomic_load(&c->congestion_milli) / 1000.0f;
+            float next = prev * 0.80f + sample * 0.20f;
+            atomic_store(&c->congestion_milli, (int)(fminf(1.0f, fmaxf(0.0f, next)) * 1000.0f));
+        }
+    }
+
+    srt_close_muxer(c);
+    pthread_mutex_lock(&c->q_mtx);
+    srt_drain_queue_locked(c);
+    pthread_mutex_unlock(&c->q_mtx);
     return NULL;
 }
 
 static bool srt_out_start(void *d) {
     struct panggung_srt_ctx *c = d;
     if (!c->url[0]) return false;
+
+    // Early codec validation before starting encoders/threads
+    obs_encoder_t *v_enc = obs_output_get_video_encoder(c->output);
+    const char *vc = v_enc ? obs_encoder_get_codec(v_enc) : NULL;
+    if (!vc || (strcmp(vc, "h264") != 0 && strcmp(vc, "hevc") != 0 && !strstr(vc, "264") && !strstr(vc, "265"))) {
+        blog(LOG_ERROR, "[panggung-srt] Rejected unsupported codec '%s' (only h264/hevc supported)", vc ? vc : "null");
+        return false;
+    }
+
     if (!obs_output_can_begin_data_capture(c->output, 0)) return false;
     if (!obs_output_initialize_encoders(c->output, 0)) return false;
 
     if (c->thread_started) {
         atomic_store(&c->stopping, true);
-        pthread_join(c->connect_thread, NULL);
+        pthread_mutex_lock(&c->q_mtx);
+        pthread_cond_broadcast(&c->q_cond);
+        pthread_mutex_unlock(&c->q_mtx);
+        pthread_join(c->worker_thread, NULL);
         c->thread_started = false;
     }
+    srt_close_muxer(c);
+    pthread_mutex_lock(&c->q_mtx);
+    srt_drain_queue_locked(c);
+    pthread_mutex_unlock(&c->q_mtx);
+
     atomic_store(&c->stopping, false);
     atomic_store(&c->connected, false);
     c->capture_started = false;
 
-    if (pthread_create(&c->connect_thread, NULL, srt_connect_worker, c) != 0) {
+    if (pthread_create(&c->worker_thread, NULL, srt_io_worker, c) != 0) {
         return false;
     }
     c->thread_started = true;
@@ -938,88 +1100,76 @@ static void srt_out_stop(void *d, uint64_t ts) {
     UNUSED_PARAMETER(ts);
     struct panggung_srt_ctx *c = d;
     atomic_store(&c->stopping, true);
-    if (c->thread_started) {
-        pthread_join(c->connect_thread, NULL);
-        c->thread_started = false;
-    }
+    pthread_mutex_lock(&c->q_mtx);
+    pthread_cond_broadcast(&c->q_cond);
+    pthread_mutex_unlock(&c->q_mtx);
     if (c->capture_started) {
         obs_output_end_data_capture(c->output);
         c->capture_started = false;
     }
-    pthread_mutex_lock(&c->write_mtx);
-    srt_close_muxer_locked(c);
-    pthread_mutex_unlock(&c->write_mtx);
+    if (c->thread_started) {
+        pthread_join(c->worker_thread, NULL);
+        c->thread_started = false;
+    }
+    srt_close_muxer(c);
+    pthread_mutex_lock(&c->q_mtx);
+    srt_drain_queue_locked(c);
+    pthread_mutex_unlock(&c->q_mtx);
 }
 
 static void srt_out_encoded_packet(void *d, struct encoder_packet *pkt) {
     struct panggung_srt_ctx *c = d;
     if (!pkt || atomic_load(&c->stopping) || !atomic_load(&c->connected)) return;
 
-    pthread_mutex_lock(&c->write_mtx);
-    if (!c->fmt || !c->fmt->pb || atomic_load(&c->stopping)) {
-        pthread_mutex_unlock(&c->write_mtx);
-        return;
-    }
-
     AVStream *st = (pkt->type == OBS_ENCODER_VIDEO) ? c->v_stream : c->a_stream;
-    if (!st) {
-        pthread_mutex_unlock(&c->write_mtx);
-        return;
-    }
+    if (!st) return;
 
     AVPacket *avpkt = av_packet_alloc();
-    if (!avpkt) {
-        pthread_mutex_unlock(&c->write_mtx);
+    if (!avpkt) return;
+    if (av_new_packet(avpkt, (int)pkt->size) != 0) {
+        av_packet_free(&avpkt);
         return;
     }
-    if (av_new_packet(avpkt, (int)pkt->size) == 0) {
-        memcpy(avpkt->data, pkt->data, pkt->size);
-        AVRational src_tb = { pkt->timebase_num > 0 ? pkt->timebase_num : 1, pkt->timebase_den > 0 ? pkt->timebase_den : 1000 };
-        avpkt->pts = av_rescale_q(pkt->pts, src_tb, st->time_base);
-        avpkt->dts = av_rescale_q(pkt->dts, src_tb, st->time_base);
-        if (avpkt->dts > avpkt->pts) avpkt->dts = avpkt->pts;
-        avpkt->stream_index = st->index;
-        if (pkt->keyframe) avpkt->flags |= AV_PKT_FLAG_KEY;
+    memcpy(avpkt->data, pkt->data, pkt->size);
+    AVRational src_tb = { pkt->timebase_num > 0 ? pkt->timebase_num : 1, pkt->timebase_den > 0 ? pkt->timebase_den : 1000 };
+    avpkt->pts = av_rescale_q(pkt->pts, src_tb, st->time_base);
+    avpkt->dts = av_rescale_q(pkt->dts, src_tb, st->time_base);
+    if (avpkt->dts > avpkt->pts) avpkt->dts = avpkt->pts;
+    avpkt->stream_index = st->index;
+    if (pkt->keyframe) avpkt->flags |= AV_PKT_FLAG_KEY;
 
-        uint64_t t0 = os_gettime_ns();
-        int ret = av_interleaved_write_frame(c->fmt, avpkt);
-        uint64_t elapsed_ms = (os_gettime_ns() - t0) / 1000000ULL;
-
-        if (ret < 0) {
-            c->dropped_frames++;
-            c->consecutive_errors++;
-            c->congestion = 1.0f;
-            if (c->consecutive_errors >= 3) {
-                atomic_store(&c->connected, false);
-                pthread_mutex_unlock(&c->write_mtx);
-                av_packet_free(&avpkt);
-                obs_output_signal_stop(c->output, OBS_OUTPUT_DISCONNECTED);
-                return;
-            }
-        } else {
-            c->consecutive_errors = 0;
-            c->total_bytes += pkt->size;
-            float sample = (elapsed_ms > 15) ? fminf(1.0f, (float)(elapsed_ms - 15) / 50.0f) : 0.0f;
-            c->congestion = c->congestion * 0.85f + sample * 0.15f;
-        }
+    // Non-blocking enqueue into bounded FIFO queue (O(1), zero network I/O on OBS encoder thread!)
+    pthread_mutex_lock(&c->q_mtx);
+    if (c->q_count >= SRT_QUEUE_CAP) {
+        // Drop oldest packet under severe backpressure so OBS encoder never stalls
+        AVPacket *dropped = c->queue[c->q_head];
+        c->queue[c->q_head] = NULL;
+        c->q_head = (c->q_head + 1) % SRT_QUEUE_CAP;
+        c->q_count--;
+        if (dropped) av_packet_free(&dropped);
+        atomic_fetch_add(&c->dropped_frames, 1);
+        atomic_store(&c->congestion_milli, 1000);
     }
-    av_packet_free(&avpkt);
-    pthread_mutex_unlock(&c->write_mtx);
+    c->queue[c->q_tail] = avpkt;
+    c->q_tail = (c->q_tail + 1) % SRT_QUEUE_CAP;
+    c->q_count++;
+    pthread_cond_signal(&c->q_cond);
+    pthread_mutex_unlock(&c->q_mtx);
 }
 
 static uint64_t srt_out_total_bytes(void *d) {
     struct panggung_srt_ctx *c = d;
-    return c->total_bytes;
+    return atomic_load(&c->total_bytes);
 }
 
 static int srt_out_dropped_frames(void *d) {
     struct panggung_srt_ctx *c = d;
-    return c->dropped_frames;
+    return atomic_load(&c->dropped_frames);
 }
 
 static float srt_out_congestion(void *d) {
     struct panggung_srt_ctx *c = d;
-    return c->congestion;
+    return (float)atomic_load(&c->congestion_milli) / 1000.0f;
 }
 
 static struct obs_output_info panggung_srt_output_info = {

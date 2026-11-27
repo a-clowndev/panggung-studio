@@ -46,19 +46,19 @@ jobs:
           VER="${TAG#v}"
           BASE="${VER%%-*}"
           IFS='.' read -r MAJ MIN PAT <<< "$BASE"
-          PRE_RANK=9
+          PRE_RANK=99
           if [[ "$VER" == *-* ]]; then
             PRE="${VER#*-}"
             NUM="${PRE##*.}"
             [[ "$NUM" =~ ^[0-9]+$ ]] || NUM=1
             case "$PRE" in
-              alpha*) PRE_RANK=$(( (NUM > 3 ? 3 : NUM) )) ;;
-              beta*)  PRE_RANK=$(( 3 + (NUM > 3 ? 3 : NUM) )) ;;
-              rc*)    PRE_RANK=$(( 6 + (NUM > 2 ? 2 : NUM) )) ;;
+              alpha*) PRE_RANK=$(( NUM > 29 ? 29 : NUM )) ;;
+              beta*)  PRE_RANK=$(( 30 + (NUM > 29 ? 29 : NUM) )) ;;
+              rc*)    PRE_RANK=$(( 60 + (NUM > 29 ? 29 : NUM) )) ;;
               *)      PRE_RANK=1 ;;
             esac
           fi
-          VCODE=$((MAJ * 100000 + MIN * 1000 + PAT * 10 + PRE_RANK))
+          VCODE=$((MAJ * 1000000 + MIN * 10000 + PAT * 100 + PRE_RANK))
           if [[ "$VCODE" -lt 1 ]]; then VCODE=1; fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version_name=$VER" >> "$GITHUB_OUTPUT"

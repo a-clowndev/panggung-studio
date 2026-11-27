@@ -29,7 +29,8 @@ data class ThermalState(
  * and dropped frame deltas to dynamically scale encoder bitrate without dropping the stream.
  */
 object ThermalGovernor {
-    private var lastAppliedBitrate = -1
+    private var lastStreamBitrate = -1
+    private var lastRecordBitrate = -1
     private var currentAbrScale = 1.0f
     private var cleanTicks = 0
     private var lastDroppedFrames = 0
@@ -60,7 +61,8 @@ object ThermalGovernor {
         if (!outputActive) {
             currentAbrScale = 1.0f
             cleanTicks = 0
-            lastAppliedBitrate = -1
+            lastStreamBitrate = -1
+            lastRecordBitrate = -1
         } else {
             if (congestion > 0.35f || droppedDelta > 2) {
                 // Fast multiplicative decrease (-25%) on network congestion or frame drops
@@ -84,23 +86,31 @@ object ThermalGovernor {
             currentAbrScale < 1.0f -> "CONGESTION"
             else -> "NORMAL"
         }
-        val targetBitrate = (baseBitrateKbps * combinedScale).toInt().coerceAtLeast(600)
-        if (outputActive && targetBitrate != lastAppliedBitrate) {
-            val applied = if (reason == "CONGESTION") {
-                // Network congestion ABR ONLY scales streaming bitrate — never degrades local recording quality
-                NativeBridge.nativeUpdateStreamBitrate(targetBitrate)
-            } else {
-                NativeBridge.nativeUpdateLiveBitrate(targetBitrate)
+        val streamTargetBitrate = (baseBitrateKbps * combinedScale).toInt().coerceAtLeast(600)
+        val recordTargetBitrate = (baseBitrateKbps * thermalScale).toInt().coerceAtLeast(800)
+        if (outputActive) {
+            // Streaming bitrate responds to BOTH thermal & network congestion
+            if (streamTargetBitrate != lastStreamBitrate) {
+                if (NativeBridge.nativeUpdateStreamBitrate(streamTargetBitrate)) {
+                    lastStreamBitrate = streamTargetBitrate
+                }
             }
-            if (applied) {
-                lastAppliedBitrate = targetBitrate
+            // Recording bitrate responds ONLY to thermal protection — NEVER degrades on network congestion
+            if (thermalScale < 1.0f && recordTargetBitrate != lastRecordBitrate) {
+                if (NativeBridge.nativeUpdateLiveBitrate(recordTargetBitrate)) {
+                    lastRecordBitrate = recordTargetBitrate
+                }
+            } else if (thermalScale >= 1.0f && lastRecordBitrate != -1 && lastRecordBitrate != baseBitrateKbps) {
+                if (NativeBridge.nativeUpdateLiveBitrate(baseBitrateKbps)) {
+                    lastRecordBitrate = baseBitrateKbps
+                }
             }
         }
         return ThermalState(
             tempC = tempC,
             headroom = headroom,
             throttled = combinedScale < 1.0f,
-            effectiveBitrateKbps = targetBitrate,
+            effectiveBitrateKbps = streamTargetBitrate,
             abrReason = reason,
         )
     }
@@ -118,7 +128,8 @@ object ThermalGovernor {
     private data class SemVer(val maj: Int, val min: Int, val pat: Int, val pre: String)
 
     private fun parseSemVer(raw: String): SemVer {
-        val trimmed = raw.trim().removePrefix("v").removePrefix("V")
+        // Strip leading v/V and build metadata (+...) per SemVer 2.0.0 §10
+        val trimmed = raw.trim().removePrefix("v").removePrefix("V").substringBefore("+")
         val core = trimmed.substringBefore("-")
         val pre = if (trimmed.contains("-")) trimmed.substringAfter("-") else ""
         val parts = core.split(".")
@@ -130,7 +141,7 @@ object ThermalGovernor {
         )
     }
 
-    /** SemVer 2.0.0 compliant comparison (stable 0.2.0 > 0.2.0-rc.1 > 0.2.0-beta.1 > 0.2.0-alpha.2 > 0.2.0-alpha.1). */
+    /** SemVer 2.0.0 §11 compliant comparison (numeric < alphanumeric, stable > prerelease). */
     internal fun isNewerVersion(remoteTag: String, currentVersion: String): Boolean {
         val r = parseSemVer(remoteTag)
         val c = parseSemVer(currentVersion)
@@ -148,7 +159,12 @@ object ThermalGovernor {
             val cp = cParts.getOrNull(i) ?: return true
             val ri = rp.toIntOrNull()
             val ci = cp.toIntOrNull()
-            val cmp = if (ri != null && ci != null) ri.compareTo(ci) else rp.compareTo(cp)
+            val cmp = when {
+                ri != null && ci != null -> ri.compareTo(ci)
+                ri != null && ci == null -> -1 // SemVer 2.0.0 §11.4.3: numeric < alphanumeric
+                ri == null && ci != null -> 1
+                else -> rp.compareTo(cp)
+            }
             if (cmp != 0) return cmp > 0
         }
         return false

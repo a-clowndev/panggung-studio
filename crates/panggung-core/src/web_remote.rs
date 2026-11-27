@@ -1,15 +1,17 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use log::{error, info};
+use log::{error, info, warn};
 
 use crate::ws_server::constant_time_eq;
 
 static WEB_RUNNING: AtomicBool = AtomicBool::new(false);
 static WEB_GENERATION: AtomicU64 = AtomicU64::new(0);
+static WEB_ACTIVE_CLIENTS: AtomicUsize = AtomicUsize::new(0);
+const MAX_WEB_CLIENTS: usize = 16;
 
 const UNAUTHORIZED_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">
@@ -80,7 +82,7 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
   </div>
 <script>
 const TOKEN = "__PANGGUNG_SESSION_TOKEN__";
-const wsUrl = `ws://${location.hostname}:4455`;
+const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.hostname}:4455`;
 let ws, rid = 0, recActive = false, identified = false;
 
 // Pure-JS SHA-256 -> Base64 (works on plain http:// LAN origins without crypto.subtle)
@@ -252,6 +254,40 @@ fn extract_http_token(req: &str) -> Option<String> {
     None
 }
 
+fn handle_http_conn<S: Read + Write>(mut stream: S, expected: &str, is_tls: bool) {
+    let mut buf = [0u8; 2048];
+    let n = stream.read(&mut buf).unwrap_or(0);
+    if n == 0 {
+        return;
+    }
+    let req = String::from_utf8_lossy(&buf[..n]);
+    let is_post_auth = req.starts_with("POST /auth");
+    let provided = extract_http_token(&req).unwrap_or_default();
+    let ok = constant_time_eq(provided.as_bytes(), expected.as_bytes());
+    let secure_attr = if is_tls { "; Secure" } else { "" };
+    let resp = if is_post_auth && ok {
+        format!(
+            "HTTP/1.1 303 See Other\r\nLocation: /\r\nSet-Cookie: panggung_token={}; HttpOnly; SameSite=Strict{}; Path=/\r\nX-Frame-Options: DENY\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            expected, secure_attr
+        )
+    } else if ok {
+        let body = REMOTE_HTML.replace("__PANGGUNG_SESSION_TOKEN__", expected);
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Frame-Options: DENY\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'self' 'unsafe-inline'; connect-src ws: wss:\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    } else {
+        format!(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/html; charset=utf-8\r\nX-Frame-Options: DENY\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            UNAUTHORIZED_HTML.len(),
+            UNAUTHORIZED_HTML
+        )
+    };
+    let _ = stream.write_all(resp.as_bytes());
+    let _ = stream.flush();
+}
+
 pub fn start_web_remote_server(port: u16, lan_access: bool, auth_token: &str) -> bool {
     if auth_token.len() < 8 {
         return false;
@@ -259,13 +295,26 @@ pub fn start_web_remote_server(port: u16, lan_access: bool, auth_token: &str) ->
     stop_web_remote_server();
     thread::sleep(Duration::from_millis(120));
 
+    let tls_cfg = if lan_access {
+        match crate::tls_config::get_or_init_lan_tls() {
+            Some(c) => Some(c),
+            None => {
+                error!("Refusing to start LAN Web Remote without TLS");
+                return false;
+            }
+        }
+    } else {
+        None
+    };
+
     let generation = WEB_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     let bind_host = if lan_access { "0.0.0.0" } else { "127.0.0.1" };
     let addr = format!("{bind_host}:{port}");
+    let scheme = if lan_access { "https" } else { "http" };
     let listener = match TcpListener::bind(&addr) {
         Ok(l) => {
             let _ = l.set_nonblocking(true);
-            info!("Built-in Web Remote UI listening on http://{addr} (auth=REQUIRED, lan={lan_access})");
+            info!("Built-in Web Remote UI listening on {scheme}://{addr} (auth=REQUIRED, tls={lan_access}, lan={lan_access})");
             l
         }
         Err(e) => {
@@ -282,34 +331,29 @@ pub fn start_web_remote_server(port: u16, lan_access: bool, auth_token: &str) ->
         .spawn(move || {
             while WEB_RUNNING.load(Ordering::SeqCst) && WEB_GENERATION.load(Ordering::SeqCst) == generation {
                 match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                        let mut buf = [0u8; 2048];
-                        let n = stream.read(&mut buf).unwrap_or(0);
-                        let req = String::from_utf8_lossy(&buf[..n]);
-                        let is_post_auth = req.starts_with("POST /auth");
-                        let provided = extract_http_token(&req).unwrap_or_default();
-                        let ok = constant_time_eq(provided.as_bytes(), expected.as_bytes());
-                        let resp = if is_post_auth && ok {
-                            format!(
-                                "HTTP/1.1 303 See Other\r\nLocation: /\r\nSet-Cookie: panggung_token={}; HttpOnly; SameSite=Strict; Path=/\r\nX-Frame-Options: DENY\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                                expected
-                            )
-                        } else if ok {
-                            let body = REMOTE_HTML.replace("__PANGGUNG_SESSION_TOKEN__", &expected);
-                            format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Frame-Options: DENY\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'self' 'unsafe-inline'; connect-src ws: wss:\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                body.len(),
-                                body
-                            )
-                        } else {
-                            format!(
-                                "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/html; charset=utf-8\r\nX-Frame-Options: DENY\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                UNAUTHORIZED_HTML.len(),
-                                UNAUTHORIZED_HTML
-                            )
-                        };
-                        let _ = stream.write_all(resp.as_bytes());
+                    Ok((stream, _)) => {
+                        if WEB_ACTIVE_CLIENTS.load(Ordering::SeqCst) >= MAX_WEB_CLIENTS {
+                            warn!("Web Remote max concurrent clients ({MAX_WEB_CLIENTS}) reached — dropping flood/slowloris connection");
+                            drop(stream);
+                            continue;
+                        }
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+                        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+                        let tls_opt = tls_cfg.clone();
+                        let exp = expected.clone();
+                        WEB_ACTIVE_CLIENTS.fetch_add(1, Ordering::SeqCst);
+                        thread::spawn(move || {
+                            if let Some(cfg) = tls_opt {
+                                if let Ok(conn) = rustls::ServerConnection::new(cfg) {
+                                    let tls_stream = rustls::StreamOwned::new(conn, stream);
+                                    handle_http_conn(tls_stream, &exp, true);
+                                }
+                            } else {
+                                handle_http_conn(stream, &exp, false);
+                            }
+                            WEB_ACTIVE_CLIENTS.fetch_sub(1, Ordering::SeqCst);
+                        });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(80));

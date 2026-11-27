@@ -61,14 +61,27 @@ pub fn start_obs_websocket_server(port: u16, lan_access: bool, auth_token: &str)
         let mut tok = WS_AUTH_TOKEN.lock().unwrap();
         *tok = auth_token.to_string();
     }
+    let tls_cfg = if lan_access {
+        match crate::tls_config::get_or_init_lan_tls() {
+            Some(c) => Some(c),
+            None => {
+                error!("Refusing to start LAN obs-websocket without TLS");
+                return false;
+            }
+        }
+    } else {
+        None
+    };
+
     WS_LAN_ACCESS.store(lan_access, Ordering::SeqCst);
     let generation = WS_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     let bind_host = if lan_access { "0.0.0.0" } else { "127.0.0.1" };
     let addr = format!("{bind_host}:{port}");
+    let scheme = if lan_access { "wss" } else { "ws" };
     let listener = match TcpListener::bind(&addr) {
         Ok(l) => {
             let _ = l.set_nonblocking(true);
-            info!("obs-websocket v5 server listening on ws://{addr} (auth=REQUIRED, lan={lan_access})");
+            info!("obs-websocket v5 server listening on {scheme}://{addr} (auth=REQUIRED, tls={lan_access}, lan={lan_access})");
             l
         }
         Err(e) => {
@@ -92,10 +105,23 @@ pub fn start_obs_websocket_server(port: u16, lan_access: bool, auth_token: &str)
                             continue;
                         }
                         let _ = stream.set_nonblocking(false);
+                        // Short read timeout so active sessions promptly detect server disable or token rotation
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
                         let tok = expected_token.clone();
+                        let tls_opt = tls_cfg.clone();
                         WS_ACTIVE_CLIENTS.fetch_add(1, Ordering::SeqCst);
                         thread::spawn(move || {
-                            handle_client(stream, &tok, generation);
+                            if let Some(cfg) = tls_opt {
+                                match rustls::ServerConnection::new(cfg) {
+                                    Ok(conn) => {
+                                        let tls_stream = rustls::StreamOwned::new(conn, stream);
+                                        handle_client(tls_stream, &tok, generation);
+                                    }
+                                    Err(e) => warn!("WSS TLS connection init failed: {e}"),
+                                }
+                            } else {
+                                handle_client(stream, &tok, generation);
+                            }
                             WS_ACTIVE_CLIENTS.fetch_sub(1, Ordering::SeqCst);
                         });
                     }
@@ -117,9 +143,7 @@ fn is_session_valid(expected_gen: u64) -> bool {
     WS_RUNNING.load(Ordering::SeqCst) && WS_GENERATION.load(Ordering::SeqCst) == expected_gen
 }
 
-fn handle_client(stream: std::net::TcpStream, password: &str, expected_gen: u64) {
-    // Short read timeout so active sessions promptly detect server disable or token rotation
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+fn handle_client<S: std::io::Read + std::io::Write>(stream: S, password: &str, expected_gen: u64) {
     let mut ws_cfg = WebSocketConfig::default();
     ws_cfg.max_message_size = Some(256 * 1024);
     ws_cfg.max_frame_size = Some(64 * 1024);
@@ -466,6 +490,16 @@ fn dispatch_request(req_type: &str, data: &Value) -> (bool, Value) {
             let oid = data.get("outputId").and_then(|x| x.as_str()).unwrap_or("null_output");
             let url = data.get("url").and_then(|x| x.as_str()).unwrap_or("");
             let br = data.get("bitrateKbps").and_then(|x| x.as_i64()).unwrap_or(4500);
+            if oid != "null_output" {
+                let lower = url.trim().to_ascii_lowercase();
+                let is_net = lower.starts_with("rtmp://")
+                    || lower.starts_with("rtmps://")
+                    || lower.starts_with("srt://")
+                    || lower.starts_with("udp://");
+                if !is_net && !is_allowed_recording_path(url, false) {
+                    return (false, json!({ "error": "Custom output path outside allowed recording directory" }));
+                }
+            }
             (ws_start_custom_output(oid, url, br), json!({}))
         }
         "StopCustomOutput" => {
@@ -623,12 +657,18 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Canonical allowlist check for recording paths (prevents arbitrary filesystem access/remux).
+/// Canonical allowlist check for recording paths (prevents arbitrary filesystem access, traversal, and symlink attacks).
 pub fn is_allowed_recording_path(path: &str, must_exist: bool) -> bool {
     if path.is_empty() || path.contains("..") || path.contains('\0') {
         return false;
     }
     let p = std::path::Path::new(path);
+    // Reject symlinks directly at target path (both existing source and existing destination)
+    if let Ok(meta) = std::fs::symlink_metadata(p) {
+        if meta.file_type().is_symlink() {
+            return false;
+        }
+    }
     let canonical = if must_exist {
         match std::fs::canonicalize(p) {
             Ok(c) => c,
@@ -637,6 +677,11 @@ pub fn is_allowed_recording_path(path: &str, must_exist: bool) -> bool {
     } else {
         let Some(parent) = p.parent() else { return false; };
         let Some(fname) = p.file_name() else { return false; };
+        if let Ok(pmeta) = std::fs::symlink_metadata(parent) {
+            if pmeta.file_type().is_symlink() {
+                return false;
+            }
+        }
         match std::fs::canonicalize(parent) {
             Ok(cp) => cp.join(fname),
             Err(_) => return false,

@@ -304,7 +304,8 @@ class MainActivity : ComponentActivity() {
                 if (!snapshot.streaming || netChanged) {
                     if (netChanged && snapshot.streaming) {
                         statusBanner = "Network switched — reconnecting stream..."
-                        NativeBridge.nativeStopStreaming()
+                        // Preserve authoritative WANT_STREAMING intent in Rust so reconnect never self-cancels
+                        NativeBridge.nativeStopStreamingForReconnect()
                         delay(800L)
                     }
                     retryAttempt++

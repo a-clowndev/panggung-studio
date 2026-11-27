@@ -3,6 +3,7 @@ mod lua_engine;
 mod obs_parity;
 mod studio_ops;
 mod web_remote;
+mod tls_config;
 mod ws_server;
 
 use std::ffi::{CStr, CString};
@@ -934,13 +935,17 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeSaveSceneCollecti
 
     match serde_json::to_string_pretty(&doc) {
         Ok(s) => {
-            // Atomic write: write to .tmp, fsync, then POSIX rename to prevent corruption on crash
+            // Atomic write + .bak rotation: write to .tmp, fsync, backup last valid collection, then POSIX rename
             let tmp_path = format!("{path}.tmp");
+            let bak_path = format!("{path}.bak");
             let ok = (|| -> std::io::Result<()> {
                 use std::io::Write;
                 let mut f = std::fs::File::create(&tmp_path)?;
                 f.write_all(s.as_bytes())?;
                 f.sync_all()?;
+                if std::path::Path::new(&path).exists() {
+                    let _ = std::fs::copy(&path, &bak_path);
+                }
                 std::fs::rename(&tmp_path, &path)?;
                 Ok(())
             })()
@@ -1451,8 +1456,25 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeLoadSceneCollecti
     mut env: JNIEnv, _class: JClass, path: JString,
 ) -> jboolean {
     let Ok(path): Result<String, _> = env.get_string(&path).map(|s| s.into()) else { return JNI_FALSE; };
-    let Ok(raw) = std::fs::read_to_string(&path) else { return JNI_FALSE; };
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else { return JNI_FALSE; };
+    let val = match std::fs::read_to_string(&path).ok().and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok()) {
+        Some(v) => v,
+        None => {
+            // Corrupt/invalid primary JSON -> quarantine to .corrupt and automatically recover from .bak
+            let bak_path = format!("{path}.bak");
+            if std::path::Path::new(&path).exists() {
+                let _ = std::fs::rename(&path, format!("{path}.corrupt"));
+                log::warn!("Scene collection '{path}' was invalid/corrupt — quarantined and attempting .bak recovery");
+            }
+            match std::fs::read_to_string(&bak_path).ok().and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok()) {
+                Some(v) => {
+                    let _ = std::fs::copy(&bak_path, &path);
+                    info!("Recovered scene collection cleanly from '{bak_path}'");
+                    v
+                }
+                None => return JNI_FALSE,
+            }
+        }
+    };
     let mut guard = STATE.lock().unwrap();
     let Some(state) = guard.as_mut() else { return JNI_FALSE; };
 
@@ -2109,10 +2131,22 @@ static WS_STREAM_CFG: Mutex<Option<(String, String, i64)>> = Mutex::new(None);
 static WANT_STREAMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn redact_url_for_log(url: &str) -> String {
-    match url.find('?') {
-        Some(idx) => format!("{}?[redacted]", &url[..idx]),
-        None => url.to_string(),
-    }
+    // Strip both userinfo (user:pass@) and query parameters (?passphrase=...&streamid=...)
+    let (base, has_q) = match url.find('?') {
+        Some(idx) => (&url[..idx], true),
+        None => (url, false),
+    };
+    let clean_base = if let Some(scheme_pos) = base.find("://") {
+        let after_scheme = &base[scheme_pos + 3..];
+        if let Some(at_pos) = after_scheme.find('@') {
+            format!("{}://[redacted]@{}", &base[..scheme_pos], &after_scheme[at_pos + 1..])
+        } else {
+            base.to_string()
+        }
+    } else {
+        base.to_string()
+    };
+    if has_q { format!("{clean_base}?[redacted]") } else { clean_base }
 }
 
 pub(crate) fn ws_set_stream_service_settings(server: &str, key: &str, bitrate_kbps: i64) {
@@ -2136,8 +2170,10 @@ pub(crate) fn ws_start_stream() -> bool {
     start_streaming_internal(&url, &key, br)
 }
 
-pub(crate) fn ws_stop_stream() -> bool {
-    WANT_STREAMING.store(false, std::sync::atomic::Ordering::SeqCst);
+fn stop_streaming_internal(clear_intent: bool) -> bool {
+    if clear_intent {
+        WANT_STREAMING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
     let mut guard = STATE.lock().unwrap();
     if let Some(state) = guard.as_mut() {
         if let Some(st) = state.streaming.take() {
@@ -2146,6 +2182,10 @@ pub(crate) fn ws_stop_stream() -> bool {
         }
     }
     false
+}
+
+pub(crate) fn ws_stop_stream() -> bool {
+    stop_streaming_internal(true)
 }
 
 pub(crate) fn ws_get_stream_status() -> (bool, u64, i32, f32) {
@@ -2182,6 +2222,16 @@ fn start_streaming_internal(url: &str, key: &str, bitrate_kbps: i64) -> bool {
     let lower_url = url.trim().to_ascii_lowercase();
     let is_srt_or_udp = lower_url.starts_with("srt://") || lower_url.starts_with("udp://");
     let safe_url = redact_url_for_log(url.trim());
+    if is_srt_or_udp {
+        // Strict codec compatibility gate for MPEG-TS/SRT: only H.264 & HEVC supported (reject AV1/VP9)
+        let enc_lower = enc_id.to_ascii_lowercase();
+        let is_supported_srt_codec = enc_lower.contains("h264") || enc_lower.contains("264")
+            || enc_lower.contains("hevc") || enc_lower.contains("265");
+        if !is_supported_srt_codec {
+            log::warn!("SRT/UDP rejected unsupported video encoder '{}' (only H.264/HEVC supported)", enc_id);
+            return false;
+        }
+    }
     unsafe {
         let Some((v_enc, a_enc)) = create_av_encoders(&enc_id, bitrate_kbps) else { return false; };
         if is_srt_or_udp {
@@ -2278,13 +2328,16 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeStartStreaming(
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeStopStreaming(_env: JNIEnv, _class: JClass) {
-    WANT_STREAMING.store(false, std::sync::atomic::Ordering::SeqCst);
-    let mut guard = STATE.lock().unwrap();
-    if let Some(state) = guard.as_mut() {
-        if let Some(st) = state.streaming.take() {
-            unsafe { st.stop_and_release(); }
-            info!("RTMP stream stopped");
-        }
+    if stop_streaming_internal(true) {
+        info!("Stream stopped cleanly");
+    }
+}
+
+/// Stops & releases active stream output during network-handoff reconnect WITHOUT clearing WANT_STREAMING intent.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeStopStreamingForReconnect(_env: JNIEnv, _class: JClass) {
+    if stop_streaming_internal(false) {
+        info!("Stream output stopped for network reconnect (intent preserved)");
     }
 }
 
@@ -2337,6 +2390,8 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeGetRemoteStatusJs
     let json = serde_json::json!({
         "enabled": ws_server::is_running(),
         "lanAccess": ws_server::is_lan_enabled(),
+        "tlsEnabled": ws_server::is_lan_enabled(),
+        "tlsFingerprint": tls_config::current_fingerprint(),
         "token": ws_server::current_auth_token(),
         "wsPort": 4455,
         "webPort": 8080,

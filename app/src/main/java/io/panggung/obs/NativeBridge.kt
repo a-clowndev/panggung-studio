@@ -70,6 +70,7 @@ object NativeBridge {
     external fun nativeStopReplayBuffer()
     external fun nativeStartStreaming(rtmpUrl: String, streamKey: String, bitrateKbps: Int): Boolean
     external fun nativeStopStreaming()
+    external fun nativeStopStreamingForReconnect()
 
     external fun nativeSetAudioAdvanced(name: String, syncMs: Int, balance: Float, mixers: Int, monitorType: Int): Boolean
     external fun nativeGetAudioAdvancedJson(name: String): String
