@@ -487,9 +487,12 @@ fn dispatch_request(req_type: &str, data: &Value) -> (bool, Value) {
             (true, json!({}))
         }
         "StartCustomOutput" => {
-            let oid = data.get("outputId").and_then(|x| x.as_str()).unwrap_or("null_output");
-            let url = data.get("url").and_then(|x| x.as_str()).unwrap_or("");
+            let oid = data.get("outputId").and_then(|x| x.as_str()).unwrap_or("");
+            let url = data.get("url").or_else(|| data.get("path")).and_then(|x| x.as_str()).unwrap_or("");
             let br = data.get("bitrateKbps").and_then(|x| x.as_i64()).unwrap_or(4500);
+            if oid.is_empty() {
+                return (false, json!({ "error": "Missing required outputId" }));
+            }
             if oid != "null_output" {
                 let lower = url.trim().to_ascii_lowercase();
                 let is_net = lower.starts_with("rtmp://")

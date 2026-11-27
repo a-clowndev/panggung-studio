@@ -92,18 +92,21 @@ def check_no_neon_green_line(png_path):
         return True, f"skip PIL: {e}"
 
 def main():
-    print("=== PANGGUNG STUDIO v0.1.0 REAL-DEVICE FULL UI TAP E2E ===", flush=True)
+    print("=== PANGGUNG STUDIO v0.2.0 REAL-DEVICE FULL UI TAP E2E ===", flush=True)
     adb("logcat", "-c")
-    adb("shell", "am", "force-stop", "io.panggung.obs")
+    adb("shell", "pm", "clear", "io.panggung.obs")
+    adb("shell", "pm", "grant", "io.panggung.obs", "android.permission.CAMERA")
+    adb("shell", "pm", "grant", "io.panggung.obs", "android.permission.RECORD_AUDIO")
+    adb("shell", "pm", "grant", "io.panggung.obs", "android.permission.POST_NOTIFICATIONS")
     adb("shell", "am", "start", "-n", "io.panggung.obs/.MainActivity")
     time.sleep(4.0)
 
     # 1. Clean branding check on startup screen
     root = dump_ui()
     has_panggung = find_node(root, text="PANGGUNG") is not None
-    has_studio_ver = find_node(root, text="STUDIO v0.1.0") is not None
+    has_studio_ver = find_node(root, text="STUDIO v0.2.0") is not None
     has_obs = find_node(root, contains="OBS") is not None
-    record("Startup Branding (PANGGUNG + STUDIO v0.1.0, zero OBS)", has_panggung and has_studio_ver and not has_obs)
+    record("Startup Branding (PANGGUNG + STUDIO v0.2.0, zero OBS)", has_panggung and has_studio_ver and not has_obs)
 
     # 2. Camera Back -> Front (1-tap!) -> Back (1-tap!) + Green Line Pixel Audit
     adb("logcat", "-c")
@@ -164,8 +167,8 @@ def main():
     screencap("/tmp/ui_03_mixer.png")
     ok_adv = tap_text(text="ADV", wait=0.8)
     ok_adv_close = tap_text(text="Close", wait=0.5)
-    ok_mute = tap_text(contains="%", wait=0.5)
-    ok_unmute = tap_text(text="MUTED", wait=0.5)
+    ok_mute = tap_text(text="100%", wait=0.6)
+    ok_unmute = tap_text(text="MUTED", wait=0.6)
     record("Mixer Tab (Stereo VU + ADV Audio Dialog + Mute/Unmute)", ok_mix and ok_adv and ok_adv_close and ok_mute and ok_unmute)
 
     # 7. Studio Tab: Studio Mode Toggle + Transitions + Fade to Black
@@ -191,13 +194,14 @@ def main():
     # 9. Settings Tab: Scroll down & test All Settings (13 Pages), Multiview
     ok_set = tap_text(text="Settings", wait=0.8)
     screencap("/tmp/ui_06_settings.png")
-    adb("shell", "input", "swipe", "540", "1900", "540", "1200", "250")
-    time.sleep(0.6)
+    for _ in range(3):
+        adb("shell", "input", "swipe", "540", "1950", "540", "700", "250")
+        time.sleep(0.4)
     ok_all = tap_text(text="All Settings (13 Pages)", wait=0.8)
-    ok_all_vid = tap_text(text="Video", wait=0.5)
-    ok_all_done = tap_text(text="Done", wait=0.5)
+    ok_all_vid = tap_text(text="Stream", wait=0.5)
+    ok_all_done = tap_text(text="Done", wait=0.5) or tap_text(text="Close", wait=0.5)
     ok_mv = tap_text(text="Multiview", wait=0.8)
-    ok_mv_close = tap_text(text="Close", wait=0.5)
+    ok_mv_close = tap_text(text="Close", wait=0.5) or tap_text(text="Done", wait=0.5)
     record("Settings Tab (13-Page Studio Settings + Multiview)", ok_set and ok_all and ok_all_vid and ok_all_done and ok_mv and ok_mv_close)
 
     # 10. Crash / ANR check in logcat

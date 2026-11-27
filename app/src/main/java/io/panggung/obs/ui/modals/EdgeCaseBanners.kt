@@ -316,8 +316,12 @@ fun RemoteQrDialog(
                         Text(webUrl, color = PanggungColors.TealActive, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
                         if (lanAccess && tlsFingerprint.isNotBlank()) {
                             Spacer(Modifier.height(2.dp))
-                            Text("TLS 1.3 Cert SHA-256 Fingerprint", color = PanggungColors.TextMuted, fontSize = 9.sp)
-                            Text(tlsFingerprint.take(47) + "…", color = PanggungColors.TextSecondary, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
+                            Text("TLS 1.3 Cert SHA-256 Fingerprint (Full)", color = PanggungColors.TextMuted, fontSize = 9.sp)
+                            Text(tlsFingerprint, color = PanggungColors.TextSecondary, fontSize = 8.sp, fontFamily = FontFamily.Monospace)
+                            BroadcastButton("Copy Cert FP", onClick = {
+                                val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                cm.setPrimaryClip(android.content.ClipData.newPlainText("Panggung TLS SHA-256", tlsFingerprint))
+                            }, compact = true, modifier = Modifier.fillMaxWidth())
                         }
                     }
                 }

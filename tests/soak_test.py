@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Soak & Thermal Stability Test Harness (QA-06) for Panggung Studio on real Android hardware.
-Polls GetStats via authenticated obs-websocket v5 (SHA-256) + battery temperature + RSS memory + logcat crash/ANR audit.
-Enforces hard pass/fail assertions on FPS, memory growth, ANRs, and native crashes.
+Polls GetStats via authenticated obs-websocket v5 (SHA-256) + battery temperature + TOTAL PSS memory + logcat crash/ANR audit.
+Enforces hard pass/fail assertions on FPS, PSS growth (including peak PSS), ANRs, and native crashes.
 """
 import argparse
 import asyncio
@@ -12,7 +12,6 @@ import json
 import os
 import re
 import subprocess
-import sys
 import time
 import websockets
 
@@ -27,21 +26,24 @@ def get_battery_temp() -> float:
     for tok in out.split():
         if tok.isdigit():
             return int(tok) / 10.0
-    return 0.0
+    raise RuntimeError("Failed to parse battery temperature from dumpsys battery")
 
 
-def get_rss_mb() -> float:
+def get_pss_mb() -> float:
+    """Reads actual Android TOTAL PSS (Proportional Set Size) in MB; fails loudly if parsing fails."""
     out = subprocess.run(["adb", "shell", "dumpsys", "meminfo", "io.panggung.obs"], capture_output=True, text=True, errors="replace").stdout
     m = re.search(r"TOTAL PSS:\s+(\d+)", out)
-    return round(int(m.group(1)) / 1024.0, 1) if m else 0.0
+    if not m:
+        raise RuntimeError(f"Failed to parse TOTAL PSS from dumpsys meminfo (app not running?): {out[:200]}")
+    return round(int(m.group(1)) / 1024.0, 1)
 
 
-async def soak(duration_sec: int, token: str, min_fps_threshold: float, max_rss_growth_mb: float):
+async def soak(duration_sec: int, token: str, min_fps_threshold: float, max_pss_growth_mb: float):
     if not token:
         raise RuntimeError("Pass --token or set PANGGUNG_TOKEN=<16-char session token>")
     subprocess.run(["adb", "forward", "tcp:4455", "tcp:4455"], check=True)
     subprocess.run(["adb", "logcat", "-c"], check=True)
-    rss_start = get_rss_mb()
+    pss_start = get_pss_mb()
 
     async with websockets.connect("ws://127.0.0.1:4455", open_timeout=10) as ws:
         hello = json.loads(await ws.recv())
@@ -55,7 +57,7 @@ async def soak(duration_sec: int, token: str, min_fps_threshold: float, max_rss_
         samples = 0
         min_fps = 999.0
         max_temp = 0.0
-        max_rss = rss_start
+        max_pss = pss_start
 
         while time.time() - start < duration_sec:
             await ws.send(json.dumps({"op": 6, "d": {"requestType": "GetStats", "requestId": f"s{samples}"}}))
@@ -64,23 +66,29 @@ async def soak(duration_sec: int, token: str, min_fps_threshold: float, max_rss_
             fps = d.get("activeFps", 0.0)
             skipped = d.get("renderSkippedFrames", 0)
             temp = get_battery_temp()
-            rss = get_rss_mb()
+            pss = get_pss_mb()
             min_fps = min(min_fps, fps)
             max_temp = max(max_temp, temp)
-            max_rss = max(max_rss, rss)
+            max_pss = max(max_pss, pss)
             samples += 1
-            print(f"[{int(time.time()-start):4d}s] fps={fps:.1f} skipped={skipped} rss={rss:.1f}MB batt_temp={temp:.1f}C", flush=True)
+            print(f"[{int(time.time()-start):4d}s] fps={fps:.1f} skipped={skipped} pss={pss:.1f}MB batt_temp={temp:.1f}C", flush=True)
             await asyncio.sleep(5)
 
-    rss_end = get_rss_mb()
-    rss_growth = rss_end - rss_start
+    pss_end = get_pss_mb()
+    pss_growth = pss_end - pss_start
+    peak_growth = max_pss - pss_start
     logs = subprocess.check_output(["adb", "logcat", "-d"], text=True, errors="replace")
     crashes = [l for l in logs.splitlines() if any(k in l for k in ["FATAL EXCEPTION", "SIGSEGV", "SIGABRT", "ANR in io.panggung.obs"])]
 
-    print(f"SOAK SUMMARY: samples={samples} min_fps={min_fps:.1f} rss_start={rss_start:.1f}MB rss_end={rss_end:.1f}MB growth={rss_growth:+.1f}MB max_temp={max_temp:.1f}C crashes={len(crashes)}")
+    print(
+        f"SOAK SUMMARY: samples={samples} min_fps={min_fps:.1f} "
+        f"pss_start={pss_start:.1f}MB pss_end={pss_end:.1f}MB pss_peak={max_pss:.1f}MB "
+        f"growth={pss_growth:+.1f}MB peak_growth={peak_growth:+.1f}MB max_temp={max_temp:.1f}C crashes={len(crashes)}"
+    )
     assert samples >= 1, "No soak samples collected"
     assert min_fps >= min_fps_threshold, f"FAIL: min_fps {min_fps:.1f} < threshold {min_fps_threshold}"
-    assert rss_growth <= max_rss_growth_mb, f"FAIL: RSS memory growth {rss_growth:+.1f}MB > {max_rss_growth_mb}MB"
+    assert pss_growth <= max_pss_growth_mb, f"FAIL: PSS memory growth {pss_growth:+.1f}MB > {max_pss_growth_mb}MB"
+    assert peak_growth <= max_pss_growth_mb, f"FAIL: Peak PSS growth {peak_growth:+.1f}MB > {max_pss_growth_mb}MB"
     assert not crashes, f"FAIL: Crashes/ANRs detected during soak: {crashes[:5]}"
     print("SOAK_TEST_ASSERTIONS_PASSED")
 
@@ -90,6 +98,6 @@ if __name__ == "__main__":
     p.add_argument("--seconds", type=int, default=30)
     p.add_argument("--token", type=str, default=os.environ.get("PANGGUNG_TOKEN", ""))
     p.add_argument("--min-fps", type=float, default=20.0)
-    p.add_argument("--max-rss-growth-mb", type=float, default=100.0)
+    p.add_argument("--max-pss-growth-mb", type=float, default=100.0)
     args = p.parse_args()
-    asyncio.run(soak(args.seconds, args.token, args.min_fps, args.max_rss_growth_mb))
+    asyncio.run(soak(args.seconds, args.token, args.min_fps, args.max_pss_growth_mb))

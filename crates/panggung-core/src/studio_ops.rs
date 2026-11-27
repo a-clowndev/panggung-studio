@@ -262,6 +262,28 @@ pub(crate) fn ws_update_live_bitrate(bitrate_kbps: i64) -> bool {
     ws_update_live_bitrate_ex(bitrate_kbps, true)
 }
 
+/// Recording-only bitrate update (thermal protection) — NEVER overwrites streaming ABR bitrate!
+pub(crate) fn ws_update_recording_bitrate(bitrate_kbps: i64) -> bool {
+    let guard = STATE.lock().unwrap();
+    let Some(state) = guard.as_ref() else { return false; };
+    let Ok(key) = CString::new("bitrate") else { return false; };
+    if let Some(b) = &state.recording {
+        if !b.v_enc.is_null() {
+            unsafe {
+                let settings = sys::obs_encoder_get_settings(b.v_enc);
+                if !settings.is_null() {
+                    sys::obs_data_set_int(settings, key.as_ptr(), bitrate_kbps.clamp(500, 50000));
+                    sys::obs_encoder_update(b.v_enc, settings);
+                    sys::obs_data_release(settings);
+                    info!("Dynamic recording-only bitrate updated to {} kbps", bitrate_kbps);
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /* ---- JNI Exports for Fase A (T-A03 & T-A04) ---- */
 
 #[unsafe(no_mangle)]
@@ -385,4 +407,11 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeUpdateStreamBitra
     _env: JNIEnv, _class: JClass, bitrate_kbps: jint,
 ) -> jboolean {
     if ws_update_live_bitrate_ex(bitrate_kbps as i64, false) { JNI_TRUE } else { JNI_FALSE }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeUpdateRecordingBitrate(
+    _env: JNIEnv, _class: JClass, bitrate_kbps: jint,
+) -> jboolean {
+    if ws_update_recording_bitrate(bitrate_kbps as i64) { JNI_TRUE } else { JNI_FALSE }
 }

@@ -48,11 +48,16 @@ def run():
         return False
 
     # 3. Compute real SSIM on cropped preview against golden reference
-    if not os.path.exists(GOLDEN_REF):
+    # Require explicit --update-baseline to create/overwrite golden reference (never silently auto-PASS!)
+    update_baseline = "--update-baseline" in sys.argv
+    if update_baseline:
         with open(CAPTURE_CROP, "rb") as src, open(GOLDEN_REF, "wb") as dst:
             dst.write(src.read())
-        print(f"[PASS] Saved initial cropped golden reference (crop={PREVIEW_CROP}, YAVG={yavg:.1f}, YMAX={ymax:.1f})")
+        print(f"[PASS] Updated cropped golden reference (crop={PREVIEW_CROP}, YAVG={yavg:.1f}, YMAX={ymax:.1f})")
         return True
+    if not os.path.exists(GOLDEN_REF):
+        print(f"[FAIL] Golden reference '{GOLDEN_REF}' missing! Run with --update-baseline first to record a verified reference.")
+        return False
 
     ssim_proc = subprocess.run(
         ["ffmpeg", "-i", CAPTURE_CROP, "-i", GOLDEN_REF, "-lavfi", "ssim", "-f", "null", "-"],

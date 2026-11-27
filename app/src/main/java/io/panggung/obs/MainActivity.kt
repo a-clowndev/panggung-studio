@@ -281,6 +281,16 @@ class MainActivity : ComponentActivity() {
                     congestion = snapshot.congestion,
                     droppedFrames = snapshot.droppedFrames,
                 )
+                if (snapshot.recording) {
+                    val recDir = getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: filesDir
+                    val freeMb = try { android.os.StatFs(recDir.absolutePath).availableBytes / (1024L * 1024L) } catch (_: Exception) { 9999L }
+                    if (freeMb < 100L) {
+                        NativeBridge.nativeStopRecording()
+                        recPaused = false
+                        statusBanner = "Recording stopped: low storage (${freeMb}MB free)"
+                        refreshSnapshot()
+                    }
+                }
                 if (thermalState.throttled && (snapshot.streaming || snapshot.recording)) {
                     statusBanner = "ABR (${thermalState.abrReason}): ${thermalState.effectiveBitrateKbps} kbps"
                 }
@@ -547,7 +557,7 @@ class MainActivity : ComponentActivity() {
                             },
                             onCheckUpdates = {
                                 coroutineScope.launch {
-                                    val curVer = try { packageManager.getPackageInfo(packageName, 0).versionName ?: "0.2.0-alpha.2" } catch (_: Exception) { "0.2.0-alpha.2" }
+                                    val curVer = try { packageManager.getPackageInfo(packageName, 0).versionName ?: "0.2.0" } catch (_: Exception) { "0.2.0" }
                                     statusBanner = ThermalGovernor.checkLatestRelease(curVer)
                                 }
                             },
@@ -711,7 +721,7 @@ class MainActivity : ComponentActivity() {
                                         ThermalGovernor.setKeepScreenOn(this@MainActivity, enabled)
                                     },
                                     onCheckUpdates = {
-                                        val curVer = try { packageManager.getPackageInfo(packageName, 0).versionName ?: "0.2.0-alpha.2" } catch (_: Exception) { "0.2.0-alpha.2" }
+                                        val curVer = try { packageManager.getPackageInfo(packageName, 0).versionName ?: "0.2.0" } catch (_: Exception) { "0.2.0" }
                                         coroutineScope.launch { statusBanner = ThermalGovernor.checkLatestRelease(curVer) }
                                     },
                                     onToggleDualCanvas = {
@@ -817,7 +827,7 @@ class MainActivity : ComponentActivity() {
             if (showLogs) {
                 LogViewerDialog(
                     crashLog = NativeBridge.nativeGetLastCrashLog(),
-                    statusLog = "Panggung Engine v0.2.0-alpha.2 | ${snapshot.baseWidth}x${snapshot.baseHeight} | FPS=${snapshot.fps}\n$statusBanner",
+                    statusLog = "Panggung Engine v0.2.0 | ${snapshot.baseWidth}x${snapshot.baseHeight} | FPS=${snapshot.fps}\n$statusBanner",
                     onDismiss = { showLogs = false },
                 )
             }
@@ -1549,6 +1559,12 @@ class MainActivity : ComponentActivity() {
         } else {
             val dir = getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: filesDir
             dir.mkdirs()
+            val freeMb = try { android.os.StatFs(dir.absolutePath).availableBytes / (1024L * 1024L) } catch (_: Exception) { 9999L }
+            if (freeMb < 200L) {
+                statusBanner = "Low storage (${freeMb}MB free) — need >= 200MB to record"
+                refreshSnapshot()
+                return
+            }
             val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
             val outFile = File(dir, "panggung_$ts.mp4").absolutePath
             lastRecordPath = outFile

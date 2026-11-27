@@ -1,5 +1,4 @@
 use std::ffi::CString;
-use std::ptr;
 use std::sync::Mutex;
 
 use log::{error, info};
@@ -14,6 +13,7 @@ struct LoadedScript {
 static SCRIPTS: Mutex<Vec<LoadedScript>> = Mutex::new(Vec::new());
 
 /// Executes an OBS Lua script with the `obslua` compatibility table (SCR-01 / SCR-03 / SCR-06).
+#[allow(dead_code)]
 pub fn load_lua_script(path: &str) -> Result<String, String> {
     let code = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
     run_lua_code(path, &code)
@@ -212,6 +212,7 @@ pub fn list_scripts_json() -> String {
     serde_json::Value::Array(arr).to_string()
 }
 
+#[allow(dead_code)]
 pub fn clear_scripts() {
     SCRIPTS.lock().unwrap().clear();
 }

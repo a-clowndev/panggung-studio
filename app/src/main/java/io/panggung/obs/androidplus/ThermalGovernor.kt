@@ -95,13 +95,13 @@ object ThermalGovernor {
                     lastStreamBitrate = streamTargetBitrate
                 }
             }
-            // Recording bitrate responds ONLY to thermal protection — NEVER degrades on network congestion
+            // Recording bitrate responds ONLY to thermal protection via recording-only API — NEVER overwrites streaming ABR!
             if (thermalScale < 1.0f && recordTargetBitrate != lastRecordBitrate) {
-                if (NativeBridge.nativeUpdateLiveBitrate(recordTargetBitrate)) {
+                if (NativeBridge.nativeUpdateRecordingBitrate(recordTargetBitrate)) {
                     lastRecordBitrate = recordTargetBitrate
                 }
             } else if (thermalScale >= 1.0f && lastRecordBitrate != -1 && lastRecordBitrate != baseBitrateKbps) {
-                if (NativeBridge.nativeUpdateLiveBitrate(baseBitrateKbps)) {
+                if (NativeBridge.nativeUpdateRecordingBitrate(baseBitrateKbps)) {
                     lastRecordBitrate = baseBitrateKbps
                 }
             }

@@ -20,6 +20,7 @@ pub struct ParityState {
     pub profiles: HashMap<String, Value>,
     pub active_profile: String,
     pub loaded_plugins: Vec<(String, bool)>,              // (name, enabled)
+    #[allow(dead_code)]
     pub output_timer_sec: u32,
 }
 

@@ -725,8 +725,20 @@ DEFINE_AUX_SOURCE(dsksrc,  "panggung_downstream_keyer",  "Downstream Keyer")
 
 DEFINE_SHADER_FILTER(autofrm, "panggung_auto_framing",  "Digital PTZ / Framing", EFFECT_DIGITAL_PTZ, "zoom", 1.25f)
 
-/* ---------- In-Process Hardware-Encoded SRT / UDP MPEG-TS Output (v0.2.0-alpha.2 Hardened) ---------- */
+/* ---------- In-Process Hardware-Encoded SRT / UDP MPEG-TS Output (v0.2.0-alpha.3 Hardened) ---------- */
 #define SRT_QUEUE_CAP 128
+
+/* Pure metadata packet stored in bounded FIFO queue so encoded_packet() NEVER touches AVStream/AVFormatContext! */
+struct srt_queued_pkt {
+    uint8_t *data;
+    size_t size;
+    int64_t pts;
+    int64_t dts;
+    int tb_num;
+    int tb_den;
+    bool is_video;
+    bool keyframe;
+};
 
 struct panggung_srt_ctx {
     obs_output_t *output;
@@ -735,20 +747,21 @@ struct panggung_srt_ctx {
     AVStream *v_stream;
     AVStream *a_stream;
 
-    // Dedicated connect + writer thread (never blocks OBS encoded_packet callback!)
+    // Dedicated connect + writer thread (sole owner of AVFormatContext & AVStream!)
     pthread_t worker_thread;
     bool thread_started;
     bool capture_started;
     atomic_bool stopping;
     atomic_bool connected;
 
-    // Bounded FIFO packet queue (OBS encoder -> writer thread)
+    // Bounded FIFO packet queue (OBS encoder -> writer thread) + GOP-aware drop state
     pthread_mutex_t q_mtx;
     pthread_cond_t q_cond;
-    AVPacket *queue[SRT_QUEUE_CAP];
+    struct srt_queued_pkt queue[SRT_QUEUE_CAP];
     int q_head;
     int q_tail;
     int q_count;
+    bool drop_until_keyframe;
 
     // Lock-free atomic stats for cross-thread OBS/ABR polling (zero data race)
     atomic_uint_least64_t total_bytes;
@@ -822,14 +835,16 @@ static void srt_extract_passphrase(const char *raw_url, char *clean_url, size_t 
 
 static void srt_drain_queue_locked(struct panggung_srt_ctx *c) {
     while (c->q_count > 0) {
-        AVPacket *p = c->queue[c->q_head];
-        c->queue[c->q_head] = NULL;
+        if (c->queue[c->q_head].data) {
+            bfree(c->queue[c->q_head].data);
+            c->queue[c->q_head].data = NULL;
+        }
         c->q_head = (c->q_head + 1) % SRT_QUEUE_CAP;
         c->q_count--;
-        if (p) av_packet_free(&p);
     }
     c->q_head = 0;
     c->q_tail = 0;
+    c->drop_until_keyframe = false;
 }
 
 static void srt_close_muxer(struct panggung_srt_ctx *c) {
@@ -1003,7 +1018,7 @@ static void *srt_io_worker(void *arg) {
     }
     blog(LOG_INFO, "[panggung-srt] Connected & streaming LIVE (dedicated writer thread) -> %s", safe_url);
 
-    // Dedicated writer loop: drains bounded FIFO queue -> av_interleaved_write_frame
+    // Dedicated writer loop: SOLE owner of c->fmt / c->v_stream / c->a_stream (zero AVStream UAF possible!)
     int consecutive_errors = 0;
     while (!atomic_load(&c->stopping)) {
         pthread_mutex_lock(&c->q_mtx);
@@ -1014,14 +1029,39 @@ static void *srt_io_worker(void *arg) {
             pthread_mutex_unlock(&c->q_mtx);
             break;
         }
-        AVPacket *pkt = c->queue[c->q_head];
-        c->queue[c->q_head] = NULL;
+        struct srt_queued_pkt qp = c->queue[c->q_head];
+        c->queue[c->q_head].data = NULL;
         c->q_head = (c->q_head + 1) % SRT_QUEUE_CAP;
         c->q_count--;
         int q_depth = c->q_count;
         pthread_mutex_unlock(&c->q_mtx);
 
-        if (!pkt) continue;
+        if (!qp.data || qp.size == 0) continue;
+        AVStream *st = qp.is_video ? c->v_stream : c->a_stream;
+        if (!st) {
+            bfree(qp.data);
+            continue;
+        }
+        AVPacket *pkt = av_packet_alloc();
+        if (!pkt) {
+            bfree(qp.data);
+            continue;
+        }
+        if (av_new_packet(pkt, (int)qp.size) != 0) {
+            av_packet_free(&pkt);
+            bfree(qp.data);
+            continue;
+        }
+        memcpy(pkt->data, qp.data, qp.size);
+        bfree(qp.data);
+
+        AVRational src_tb = { qp.tb_num > 0 ? qp.tb_num : 1, qp.tb_den > 0 ? qp.tb_den : 1000 };
+        pkt->pts = av_rescale_q(qp.pts, src_tb, st->time_base);
+        pkt->dts = av_rescale_q(qp.dts, src_tb, st->time_base);
+        if (pkt->dts > pkt->pts) pkt->dts = pkt->pts;
+        pkt->stream_index = st->index;
+        if (qp.keyframe) pkt->flags |= AV_PKT_FLAG_KEY;
+
         int pkt_sz = pkt->size;
         uint64_t t0 = os_gettime_ns();
         int wret = av_interleaved_write_frame(c->fmt, pkt);
@@ -1034,13 +1074,13 @@ static void *srt_io_worker(void *arg) {
             atomic_store(&c->congestion_milli, 1000);
             if (consecutive_errors >= 3) {
                 atomic_store(&c->connected, false);
+                atomic_store(&c->stopping, true);
                 obs_output_signal_stop(c->output, OBS_OUTPUT_DISCONNECTED);
                 break;
             }
         } else {
             consecutive_errors = 0;
             atomic_fetch_add(&c->total_bytes, (uint64_t)pkt_sz);
-            // Combine real queue fill ratio + write latency into congestion [0..1000]
             float q_ratio = (float)q_depth / (float)SRT_QUEUE_CAP;
             float lat_ratio = (elapsed_ms > 15) ? fminf(1.0f, (float)(elapsed_ms - 15) / 50.0f) : 0.0f;
             float sample = fmaxf(q_ratio, lat_ratio);
@@ -1100,57 +1140,86 @@ static void srt_out_stop(void *d, uint64_t ts) {
     UNUSED_PARAMETER(ts);
     struct panggung_srt_ctx *c = d;
     atomic_store(&c->stopping, true);
+    atomic_store(&c->connected, false);
     pthread_mutex_lock(&c->q_mtx);
     pthread_cond_broadcast(&c->q_cond);
     pthread_mutex_unlock(&c->q_mtx);
-    if (c->capture_started) {
-        obs_output_end_data_capture(c->output);
-        c->capture_started = false;
-    }
-    if (c->thread_started) {
+    if (c->thread_started && !pthread_equal(pthread_self(), c->worker_thread)) {
         pthread_join(c->worker_thread, NULL);
         c->thread_started = false;
     }
-    srt_close_muxer(c);
-    pthread_mutex_lock(&c->q_mtx);
-    srt_drain_queue_locked(c);
-    pthread_mutex_unlock(&c->q_mtx);
+    if (c->capture_started) {
+        c->capture_started = false;
+        obs_output_end_data_capture(c->output);
+    }
 }
 
 static void srt_out_encoded_packet(void *d, struct encoder_packet *pkt) {
     struct panggung_srt_ctx *c = d;
-    if (!pkt || atomic_load(&c->stopping) || !atomic_load(&c->connected)) return;
+    if (!pkt || !pkt->data || pkt->size == 0 || atomic_load(&c->stopping) || !atomic_load(&c->connected)) return;
 
-    AVStream *st = (pkt->type == OBS_ENCODER_VIDEO) ? c->v_stream : c->a_stream;
-    if (!st) return;
+    bool is_video = (pkt->type == OBS_ENCODER_VIDEO);
+    pthread_mutex_lock(&c->q_mtx);
 
-    AVPacket *avpkt = av_packet_alloc();
-    if (!avpkt) return;
-    if (av_new_packet(avpkt, (int)pkt->size) != 0) {
-        av_packet_free(&avpkt);
+    // GOP-aware packet dropping: if recovering from congestion, drop non-keyframe video until next IDR keyframe
+    if (is_video && c->drop_until_keyframe) {
+        if (!pkt->keyframe) {
+            atomic_fetch_add(&c->dropped_frames, 1);
+            pthread_mutex_unlock(&c->q_mtx);
+            return;
+        }
+        c->drop_until_keyframe = false;
+    }
+
+    if (c->q_count >= SRT_QUEUE_CAP) {
+        // Under backpressure: purge queued video packets to make room & wait for clean next keyframe (preserves audio!)
+        struct srt_queued_pkt kept[SRT_QUEUE_CAP];
+        int kept_n = 0;
+        for (int i = 0; i < c->q_count; i++) {
+            int idx = (c->q_head + i) % SRT_QUEUE_CAP;
+            struct srt_queued_pkt item = c->queue[idx];
+            c->queue[idx].data = NULL;
+            if (!item.is_video && kept_n < SRT_QUEUE_CAP - 1) {
+                kept[kept_n++] = item;
+            } else {
+                if (item.data) bfree(item.data);
+                atomic_fetch_add(&c->dropped_frames, 1);
+            }
+        }
+        for (int i = 0; i < kept_n; i++) {
+            c->queue[i] = kept[i];
+        }
+        c->q_head = 0;
+        c->q_tail = kept_n % SRT_QUEUE_CAP;
+        c->q_count = kept_n;
+        c->drop_until_keyframe = true;
+        atomic_store(&c->congestion_milli, 1000);
+        if (is_video && !pkt->keyframe) {
+            atomic_fetch_add(&c->dropped_frames, 1);
+            pthread_mutex_unlock(&c->q_mtx);
+            return;
+        }
+        if (is_video && pkt->keyframe) {
+            c->drop_until_keyframe = false;
+        }
+    }
+
+    uint8_t *copy = bmemdup(pkt->data, pkt->size);
+    if (!copy) {
+        pthread_mutex_unlock(&c->q_mtx);
         return;
     }
-    memcpy(avpkt->data, pkt->data, pkt->size);
-    AVRational src_tb = { pkt->timebase_num > 0 ? pkt->timebase_num : 1, pkt->timebase_den > 0 ? pkt->timebase_den : 1000 };
-    avpkt->pts = av_rescale_q(pkt->pts, src_tb, st->time_base);
-    avpkt->dts = av_rescale_q(pkt->dts, src_tb, st->time_base);
-    if (avpkt->dts > avpkt->pts) avpkt->dts = avpkt->pts;
-    avpkt->stream_index = st->index;
-    if (pkt->keyframe) avpkt->flags |= AV_PKT_FLAG_KEY;
-
-    // Non-blocking enqueue into bounded FIFO queue (O(1), zero network I/O on OBS encoder thread!)
-    pthread_mutex_lock(&c->q_mtx);
-    if (c->q_count >= SRT_QUEUE_CAP) {
-        // Drop oldest packet under severe backpressure so OBS encoder never stalls
-        AVPacket *dropped = c->queue[c->q_head];
-        c->queue[c->q_head] = NULL;
-        c->q_head = (c->q_head + 1) % SRT_QUEUE_CAP;
-        c->q_count--;
-        if (dropped) av_packet_free(&dropped);
-        atomic_fetch_add(&c->dropped_frames, 1);
-        atomic_store(&c->congestion_milli, 1000);
-    }
-    c->queue[c->q_tail] = avpkt;
+    struct srt_queued_pkt qp = {
+        .data = copy,
+        .size = pkt->size,
+        .pts = pkt->pts,
+        .dts = pkt->dts,
+        .tb_num = pkt->timebase_num,
+        .tb_den = pkt->timebase_den,
+        .is_video = is_video,
+        .keyframe = pkt->keyframe,
+    };
+    c->queue[c->q_tail] = qp;
     c->q_tail = (c->q_tail + 1) % SRT_QUEUE_CAP;
     c->q_count++;
     pthread_cond_signal(&c->q_cond);

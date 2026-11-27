@@ -36,10 +36,10 @@ pub fn install_crash_handler(config_dir: &str) {
         return;
     }
     unsafe {
-        libc::signal(libc::SIGSEGV, crash_signal_handler as libc::sighandler_t);
-        libc::signal(libc::SIGABRT, crash_signal_handler as libc::sighandler_t);
-        libc::signal(libc::SIGBUS, crash_signal_handler as libc::sighandler_t);
-        libc::signal(libc::SIGFPE, crash_signal_handler as libc::sighandler_t);
+        libc::signal(libc::SIGSEGV, crash_signal_handler as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGABRT, crash_signal_handler as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGBUS, crash_signal_handler as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGFPE, crash_signal_handler as *const () as libc::sighandler_t);
     }
 }
 
