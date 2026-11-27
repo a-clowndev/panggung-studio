@@ -46,6 +46,8 @@ unsafe extern "C" fn volmeter_cb(
     }
 }
 
+static VOLMETERS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
 fn attach_volmeter_to_source(src: *mut sys::obs_source_t, name: &str) {
     unsafe {
         let vm = sys::obs_volmeter_create(0); // OBS_FADER_CUBIC
@@ -57,6 +59,23 @@ fn attach_volmeter_to_source(src: *mut sys::obs_source_t, name: &str) {
         if !sys::obs_volmeter_attach_source(vm, src) {
             sys::obs_volmeter_destroy(vm);
             let _ = Box::from_raw(boxed);
+        } else if let Ok(mut list) = VOLMETERS.lock() {
+            list.push((vm as usize, boxed as usize));
+        }
+    }
+}
+
+fn destroy_all_volmeters() {
+    let items: Vec<(usize, usize)> = VOLMETERS
+        .lock()
+        .map(|mut v| std::mem::take(&mut *v))
+        .unwrap_or_default();
+    for (vm_ptr, boxed_ptr) in items {
+        unsafe {
+            let vm = vm_ptr as *mut libc::c_void;
+            sys::obs_volmeter_detach_source(vm);
+            sys::obs_volmeter_destroy(vm);
+            let _ = Box::from_raw(boxed_ptr as *mut String);
         }
     }
 }
@@ -964,6 +983,7 @@ pub(crate) struct StudioSnapshot {
     pub lagged_frames: u32,
     pub dropped_frames: i32,
     pub output_bytes: u64,
+    pub congestion: f32,
     pub recording: bool,
     pub streaming: bool,
     pub replay_active: bool,
@@ -977,7 +997,7 @@ pub(crate) fn ws_get_snapshot() -> StudioSnapshot {
             transition_id: "".into(), transition_ms: 300, video_encoder_id: "".into(),
             base_width: 1280, base_height: 720, sources: vec![],
             fps: 0.0, frame_time_ms: 0.0, total_frames: 0, lagged_frames: 0,
-            dropped_frames: 0, output_bytes: 0,
+            dropped_frames: 0, output_bytes: 0, congestion: 0.0,
             recording: false, streaming: false, replay_active: false,
         };
     };
@@ -1008,12 +1028,18 @@ pub(crate) fn ws_get_snapshot() -> StudioSnapshot {
             }
         }
     }
-    let (dropped_frames, output_bytes) = if let Some(st) = &state.streaming {
-        unsafe { (sys::obs_output_get_frames_dropped(st.output), sys::obs_output_get_total_bytes(st.output)) }
+    let (dropped_frames, output_bytes, congestion) = if let Some(st) = &state.streaming {
+        unsafe {
+            (
+                sys::obs_output_get_frames_dropped(st.output),
+                sys::obs_output_get_total_bytes(st.output),
+                sys::obs_output_get_congestion(st.output),
+            )
+        }
     } else if let Some(rc) = &state.recording {
-        unsafe { (sys::obs_output_get_frames_dropped(rc.output), sys::obs_output_get_total_bytes(rc.output)) }
+        unsafe { (sys::obs_output_get_frames_dropped(rc.output), sys::obs_output_get_total_bytes(rc.output), 0.0) }
     } else {
-        (0, 0)
+        (0, 0, 0.0)
     };
     StudioSnapshot {
         scenes: state.scenes.iter().map(|s| s.name.clone()).collect(),
@@ -1032,6 +1058,7 @@ pub(crate) fn ws_get_snapshot() -> StudioSnapshot {
         lagged_frames: unsafe { sys::obs_get_lagged_frames() },
         dropped_frames,
         output_bytes,
+        congestion,
         recording: state.recording.as_ref().map(|r| unsafe { sys::obs_output_active(r.output) }).unwrap_or(false),
         streaming: state.streaming.as_ref().map(|s| unsafe { sys::obs_output_active(s.output) }).unwrap_or(false),
         replay_active: state.replay.as_ref().map(|r| unsafe { sys::obs_output_active(r.output) }).unwrap_or(false),
@@ -2076,29 +2103,124 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeStopRecording(_en
     info!("Recording stopped");
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeStartStreaming(
-    mut env: JNIEnv, _class: JClass, rtmp_url: JString, stream_key: JString, bitrate_kbps: jint,
-) -> jboolean {
-    let Ok(url): Result<String, _> = env.get_string(&rtmp_url).map(|s| s.into()) else { return JNI_FALSE; };
-    let Ok(key): Result<String, _> = env.get_string(&stream_key).map(|s| s.into()) else { return JNI_FALSE; };
+static WS_STREAM_CFG: Mutex<Option<(String, String, i64)>> = Mutex::new(None);
+
+pub(crate) fn ws_set_stream_service_settings(server: &str, key: &str, bitrate_kbps: i64) {
+    if let Ok(mut g) = WS_STREAM_CFG.lock() {
+        *g = Some((server.trim().to_string(), key.trim().to_string(), bitrate_kbps.clamp(600, 50_000)));
+    }
+}
+
+pub(crate) fn ws_get_stream_service_settings() -> (String, i64) {
+    WS_STREAM_CFG
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|(s, _, b)| (s.clone(), *b)))
+        .unwrap_or_else(|| (String::new(), 4500))
+}
+
+pub(crate) fn ws_start_stream() -> bool {
+    let cfg = WS_STREAM_CFG.lock().ok().and_then(|g| g.clone());
+    let Some((url, key, br)) = cfg else { return false; };
+    if url.is_empty() { return false; }
+    start_streaming_internal(&url, &key, br)
+}
+
+pub(crate) fn ws_stop_stream() -> bool {
     let mut guard = STATE.lock().unwrap();
-    let Some(state) = guard.as_mut() else { return JNI_FALSE; };
-    if state.streaming.is_some() { return JNI_TRUE; }
+    if let Some(state) = guard.as_mut() {
+        if let Some(st) = state.streaming.take() {
+            unsafe { st.stop_and_release(); }
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn ws_get_stream_status() -> (bool, u64, i32, f32) {
+    let guard = STATE.lock().unwrap();
+    let Some(state) = guard.as_ref() else { return (false, 0, 0, 0.0); };
+    if let Some(st) = &state.streaming {
+        unsafe {
+            let active = sys::obs_output_active(st.output);
+            let bytes = sys::obs_output_get_total_bytes(st.output);
+            let dropped = sys::obs_output_get_frames_dropped(st.output);
+            let congestion = sys::obs_output_get_congestion(st.output);
+            (active, bytes, dropped, congestion)
+        }
+    } else {
+        (false, 0, 0, 0.0)
+    }
+}
+
+fn start_streaming_internal(url: &str, key: &str, bitrate_kbps: i64) -> bool {
+    let mut guard = STATE.lock().unwrap();
+    let Some(state) = guard.as_mut() else { return false; };
+    if let Some(existing) = &state.streaming {
+        let still_active = unsafe { sys::obs_output_active(existing.output) };
+        if still_active {
+            return true;
+        }
+        // Clean up dropped/disconnected output before reconnecting
+        if let Some(dead) = state.streaming.take() {
+            unsafe { dead.stop_and_release(); }
+        }
+    }
 
     let enc_id = state.video_encoder_id.clone();
+    let lower_url = url.trim().to_ascii_lowercase();
+    let is_srt_or_udp = lower_url.starts_with("srt://") || lower_url.starts_with("udp://");
     unsafe {
-        let Some((v_enc, a_enc)) = create_av_encoders(&enc_id, bitrate_kbps as i64) else { return JNI_FALSE; };
-        let Ok(mut svc_data) = ObsData::new() else { return JNI_FALSE; };
-        let _ = svc_data.set_string("server", &url);
-        let _ = svc_data.set_string("key", &key);
+        if is_srt_or_udp {
+            // First-class in-process SRT / MPEG-TS streaming via obs-ffmpeg's `ffmpeg_output`
+            // (uses our compiled libavformat.so + libsrt v1.5.4 + mbedTLS directly in-process,
+            // avoiding desktop `ffmpeg_mpegts_muxer` which tries to fork/exec `obs-ffmpeg-mux`).
+            let mut full_url = if !key.trim().is_empty() && !url.contains("streamid=") {
+                let sep = if url.contains('?') { "&" } else { "?" };
+                format!("{url}{sep}streamid={}", key.trim())
+            } else {
+                url.to_string()
+            };
+            if lower_url.starts_with("srt://") && !full_url.contains("connect_timeout=") {
+                let sep = if full_url.contains('?') { "&" } else { "?" };
+                full_url.push_str(&format!("{sep}connect_timeout=3000"));
+            }
+            let Ok(mut out_data) = ObsData::new() else {
+                return false;
+            };
+            let _ = out_data.set_string("url", &full_url);
+            let _ = out_data.set_string("format_name", "mpegts");
+            let _ = out_data.set_string("video_encoder", "libx264");
+            let _ = out_data.set_string("audio_encoder", "aac");
+            let _ = out_data.set_int("video_bitrate", bitrate_kbps);
+            let _ = out_data.set_int("audio_bitrate", 128);
+            let _ = out_data.set_int("gop_size", 60);
+            let _ = out_data.set_string("video_settings", "preset=ultrafast tune=zerolatency");
+            let out_id = CString::new("ffmpeg_output").unwrap();
+            let out_name = CString::new("SRT Stream").unwrap();
+            let output = sys::obs_output_create(out_id.as_ptr(), out_name.as_ptr(), out_data.as_ptr(), ptr::null_mut());
+            if output.is_null() {
+                return false;
+            }
+            if !sys::obs_output_start(output) {
+                sys::obs_output_release(output);
+                return false;
+            }
+            info!("SRT/MPEG-TS in-process stream started (ffmpeg_output) -> {url}");
+            state.streaming = Some(OutputBundle { output, v_enc: ptr::null_mut(), a_enc: ptr::null_mut(), service: ptr::null_mut() });
+            return true;
+        }
+        let Some((v_enc, a_enc)) = create_av_encoders(&enc_id, bitrate_kbps) else { return false; };
+        let Ok(mut svc_data) = ObsData::new() else { return false; };
+        let _ = svc_data.set_string("server", url);
+        let _ = svc_data.set_string("key", key);
         let svc_id = CString::new("rtmp_custom").unwrap();
         let svc_name = CString::new("Custom RTMP").unwrap();
         let service = sys::obs_service_create(svc_id.as_ptr(), svc_name.as_ptr(), svc_data.as_ptr(), ptr::null_mut());
         if service.is_null() {
             sys::obs_encoder_release(v_enc);
             sys::obs_encoder_release(a_enc);
-            return JNI_FALSE;
+            return false;
         }
         let out_id = CString::new("rtmp_output").unwrap();
         let out_name = CString::new("RTMP Stream").unwrap();
@@ -2107,7 +2229,7 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeStartStreaming(
             sys::obs_service_release(service);
             sys::obs_encoder_release(v_enc);
             sys::obs_encoder_release(a_enc);
-            return JNI_FALSE;
+            return false;
         }
         sys::obs_output_set_service(output, service);
         sys::obs_output_set_video_encoder(output, v_enc);
@@ -2117,12 +2239,22 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeStartStreaming(
             sys::obs_service_release(service);
             sys::obs_encoder_release(v_enc);
             sys::obs_encoder_release(a_enc);
-            return JNI_FALSE;
+            return false;
         }
         info!("RTMP stream started ({enc_id}) -> {url}");
         state.streaming = Some(OutputBundle { output, v_enc, a_enc, service });
     }
-    JNI_TRUE
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeStartStreaming(
+    mut env: JNIEnv, _class: JClass, rtmp_url: JString, stream_key: JString, bitrate_kbps: jint,
+) -> jboolean {
+    let Ok(url): Result<String, _> = env.get_string(&rtmp_url).map(|s| s.into()) else { return JNI_FALSE; };
+    let Ok(key): Result<String, _> = env.get_string(&stream_key).map(|s| s.into()) else { return JNI_FALSE; };
+    ws_set_stream_service_settings(&url, &key, bitrate_kbps as i64);
+    if start_streaming_internal(&url, &key, bitrate_kbps as i64) { JNI_TRUE } else { JNI_FALSE }
 }
 
 #[unsafe(no_mangle)]
@@ -2194,21 +2326,99 @@ pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeGetRemoteStatusJs
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeRenameSource(
+    mut env: JNIEnv,
+    _class: JClass,
+    old_name: JString,
+    new_name: JString,
+) -> jboolean {
+    let Ok(old_s): Result<String, _> = env.get_string(&old_name).map(|s| s.into()) else { return JNI_FALSE; };
+    let Ok(new_s): Result<String, _> = env.get_string(&new_name).map(|s| s.into()) else { return JNI_FALSE; };
+    if old_s.is_empty() || new_s.is_empty() || old_s == new_s { return JNI_TRUE; }
+    let Ok(c_old) = CString::new(old_s.as_str()) else { return JNI_FALSE; };
+    let Ok(c_new) = CString::new(new_s.as_str()) else { return JNI_FALSE; };
+    let mut guard = STATE.lock().unwrap();
+    let Some(state) = guard.as_mut() else { return JNI_FALSE; };
+    unsafe {
+        let src = sys::obs_get_source_by_name(c_old.as_ptr());
+        if src.is_null() { return JNI_FALSE; }
+        sys::obs_source_set_name(src, c_new.as_ptr());
+        let actual_ptr = sys::obs_source_get_name(src);
+        let actual_name = if actual_ptr.is_null() {
+            new_s.clone()
+        } else {
+            CStr::from_ptr(actual_ptr).to_string_lossy().into_owned()
+        };
+        sys::obs_source_release(src);
+        for sc in state.scenes.iter_mut() {
+            for s in sc.sources.iter_mut() {
+                if *s == old_s {
+                    *s = actual_name.clone();
+                }
+            }
+        }
+    }
+    JNI_TRUE
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_io_panggung_obs_NativeBridge_nativeShutdown(_env: JNIEnv, _class: JClass) {
     ws_server::stop_obs_websocket_server();
     web_remote::stop_web_remote_server();
     let mut guard = STATE.lock().unwrap();
     if let Some(mut state) = guard.take() {
+        // 1. Stop all active outputs first
         if let Some(rec) = state.recording.take() { unsafe { rec.stop_and_release(); } }
         if let Some(st) = state.streaming.take() { unsafe { st.stop_and_release(); } }
         if let Some(rp) = state.replay.take() { unsafe { rp.stop_and_release(); } }
+        for ms in state.multistreams.drain(..) { unsafe { ms.stop_and_release(); } }
+        if let Some(co) = state.custom_output.take() { unsafe { co.stop_and_release(); } }
+
+        // 2. Detach & destroy all volmeters before releasing sources
+        destroy_all_volmeters();
+
         unsafe {
-            if !state.display.is_null() { sys::obs_display_destroy(state.display); }
-            if !state.native_window.is_null() { ANativeWindow_release(state.native_window); }
-            sys::obs_set_output_source(0, ptr::null_mut());
-            if !state.transition.is_null() { sys::obs_source_release(state.transition); }
-            for sc in state.scenes { sys::obs_scene_release(sc.scene); }
+            // 3. Destroy displays & dual-canvas views
+            if !state.display.is_null() {
+                sys::obs_display_destroy(state.display);
+                state.display = ptr::null_mut();
+            }
+            if !state.native_window.is_null() {
+                ANativeWindow_release(state.native_window);
+                state.native_window = ptr::null_mut();
+            }
+            if !state.projector_display.is_null() {
+                sys::obs_display_destroy(state.projector_display);
+                state.projector_display = ptr::null_mut();
+            }
+            if !state.projector_window.is_null() {
+                ANativeWindow_release(state.projector_window);
+                state.projector_window = ptr::null_mut();
+            }
+            if !state.vertical_view.is_null() {
+                sys::obs_view_remove(state.vertical_view);
+                sys::obs_view_destroy(state.vertical_view);
+                state.vertical_view = ptr::null_mut();
+            }
+
+            // 4. Clear all OBS output channels & transition references
+            for ch in 0..64u32 {
+                sys::obs_set_output_source(ch, ptr::null_mut());
+            }
+            if !state.transition.is_null() {
+                sys::obs_transition_clear(state.transition);
+                sys::obs_source_release(state.transition);
+                state.transition = ptr::null_mut();
+            }
+
+            // 5. Release all scenes while libobs modules (e.g. text-freetype2) are still loaded
+            for sc in state.scenes.drain(..) {
+                sys::obs_scene_release(sc.scene);
+            }
         }
+
+        // 6. Flush deferred source destruction on OBS video thread BEFORE obs_shutdown() unloads modules (prevents FT_Done_Face after FT_Done_FreeType)
+        std::thread::sleep(std::time::Duration::from_millis(120));
         drop(state.ctx);
     }
     info!("libobs shut down cleanly");

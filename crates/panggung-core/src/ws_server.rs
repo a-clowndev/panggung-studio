@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::Read;
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
@@ -9,8 +9,8 @@ use std::time::Duration;
 use log::{error, info, warn};
 use serde_json::{Value, json};
 use tungstenite::protocol::frame::coding::CloseCode;
-use tungstenite::protocol::CloseFrame;
-use tungstenite::{Message, accept};
+use tungstenite::protocol::{CloseFrame, WebSocketConfig};
+use tungstenite::{Message, accept_with_config};
 
 use crate::{
     ws_add_filter, ws_create_scene, ws_get_audio_advanced_json, ws_get_snapshot,
@@ -25,7 +25,9 @@ use crate::{
 static WS_RUNNING: AtomicBool = AtomicBool::new(false);
 static WS_LAN_ACCESS: AtomicBool = AtomicBool::new(false);
 static WS_GENERATION: AtomicU64 = AtomicU64::new(0);
+static WS_ACTIVE_CLIENTS: AtomicUsize = AtomicUsize::new(0);
 static WS_AUTH_TOKEN: Mutex<String> = Mutex::new(String::new());
+const MAX_WS_CLIENTS: usize = 16;
 
 pub fn is_running() -> bool {
     WS_RUNNING.load(Ordering::SeqCst)
@@ -84,9 +86,18 @@ pub fn start_obs_websocket_server(port: u16, lan_access: bool, auth_token: &str)
             while WS_RUNNING.load(Ordering::SeqCst) && WS_GENERATION.load(Ordering::SeqCst) == generation {
                 match listener.accept() {
                     Ok((stream, _peer)) => {
+                        if WS_ACTIVE_CLIENTS.load(Ordering::SeqCst) >= MAX_WS_CLIENTS {
+                            warn!("obs-websocket max concurrent clients ({MAX_WS_CLIENTS}) reached — rejecting");
+                            drop(stream);
+                            continue;
+                        }
                         let _ = stream.set_nonblocking(false);
                         let tok = expected_token.clone();
-                        thread::spawn(move || handle_client(stream, &tok, generation));
+                        WS_ACTIVE_CLIENTS.fetch_add(1, Ordering::SeqCst);
+                        thread::spawn(move || {
+                            handle_client(stream, &tok, generation);
+                            WS_ACTIVE_CLIENTS.fetch_sub(1, Ordering::SeqCst);
+                        });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(80));
@@ -109,7 +120,10 @@ fn is_session_valid(expected_gen: u64) -> bool {
 fn handle_client(stream: std::net::TcpStream, password: &str, expected_gen: u64) {
     // Short read timeout so active sessions promptly detect server disable or token rotation
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-    let mut ws = match accept(stream) {
+    let mut ws_cfg = WebSocketConfig::default();
+    ws_cfg.max_message_size = Some(256 * 1024);
+    ws_cfg.max_frame_size = Some(64 * 1024);
+    let mut ws = match accept_with_config(stream, Some(ws_cfg)) {
         Ok(w) => w,
         Err(e) => {
             warn!("WS handshake failed: {e}");
@@ -344,8 +358,13 @@ fn dispatch_request(req_type: &str, data: &Value) -> (bool, Value) {
             (true, v)
         }
         "GetStreamStatus" => {
-            let snap = ws_get_snapshot();
-            (true, json!({ "outputActive": snap.streaming }))
+            let (active, bytes, dropped, congestion) = crate::ws_get_stream_status();
+            (true, json!({
+                "outputActive": active,
+                "outputBytes": bytes,
+                "outputSkippedFrames": dropped,
+                "outputCongestion": congestion
+            }))
         }
         "GetStats" => {
             let snap = ws_get_snapshot();
@@ -416,6 +435,23 @@ fn dispatch_request(req_type: &str, data: &Value) -> (bool, Value) {
             }
             (ws_remux_to_mp4(src, dst), json!({}))
         }
+        "SetStreamServiceSettings" => {
+            let s = data.get("streamServiceSettings").unwrap_or(data);
+            let server = s.get("server").and_then(|x| x.as_str()).unwrap_or("");
+            let key = s.get("key").and_then(|x| x.as_str()).unwrap_or("");
+            let br = s.get("bitrateKbps").and_then(|x| x.as_i64()).unwrap_or(4500);
+            crate::ws_set_stream_service_settings(server, key, br);
+            (true, json!({}))
+        }
+        "GetStreamServiceSettings" => {
+            let (server, br) = crate::ws_get_stream_service_settings();
+            (true, json!({
+                "streamServiceType": "rtmp_custom",
+                "streamServiceSettings": { "server": server, "bitrateKbps": br }
+            }))
+        }
+        "StartStream" => (crate::ws_start_stream(), json!({})),
+        "StopStream" => (crate::ws_stop_stream(), json!({})),
         "StartMultistream" => {
             let url = data.get("url").and_then(|x| x.as_str()).unwrap_or("");
             let key = data.get("key").and_then(|x| x.as_str()).unwrap_or("");

@@ -91,6 +91,7 @@ object NativeBridge {
 
     // Fase A: Complete OBS Scene, Source, Media & Studio Mode T-Bar APIs
     external fun nativeMoveSourceOrder(name: String, direction: Int): Boolean
+    external fun nativeRenameSource(oldName: String, newName: String): Boolean
     external fun nativeSetSourceLocked(name: String, locked: Boolean): Boolean
     external fun nativeFitSourceToScreen(name: String): Boolean
     external fun nativeGetSourceTransformJson(name: String): String

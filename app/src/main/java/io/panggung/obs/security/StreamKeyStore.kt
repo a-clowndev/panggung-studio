@@ -34,6 +34,10 @@ object StreamKeyStore {
 
     fun saveStreamKey(ctx: Context, plainKey: String) {
         try {
+            if (plainKey.isEmpty()) {
+                ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(KEY_STREAM).apply()
+                return
+            }
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey())
             val iv = cipher.iv

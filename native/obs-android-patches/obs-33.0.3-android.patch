@@ -399,6 +399,29 @@ index d7880e5..56df4b7 100644
  #include "vaapi-utils.h"
  
  #define LIBAVUTIL_VAAPI_AVAILABLE
+diff --git a/plugins/obs-outputs/librtmp/rtmp.c b/plugins/obs-outputs/librtmp/rtmp.c
+index 1898558..f88097e 100644
+--- a/plugins/obs-outputs/librtmp/rtmp.c
++++ b/plugins/obs-outputs/librtmp/rtmp.c
+@@ -339,6 +339,18 @@ RTMP_TLS_LoadCerts(RTMP *r) {
+ 
+     CFRelease(anchors);
+ 
++#elif defined(__ANDROID__)
++    int ca_loaded = 0;
++    if (mbedtls_x509_crt_parse_path(chain, "/apex/com.android.conscrypt/cacerts") >= 0) {
++        ca_loaded = 1;
++    }
++    if (mbedtls_x509_crt_parse_path(chain, "/system/etc/security/cacerts") >= 0) {
++        ca_loaded = 1;
++    }
++    if (!ca_loaded) {
++        RTMP_Log(RTMP_LOGERROR, "mbedtls_x509_crt_parse_path: Couldn't parse Android CA certs");
++        goto error;
++    }
+ #elif defined(__linux__) || defined(__FreeBSD__)
+     if (mbedtls_x509_crt_parse_path(chain, "/etc/ssl/certs/") < 0) {
+         RTMP_Log(RTMP_LOGERROR, "mbedtls_x509_crt_parse_path: Couldn't parse "
 diff --git a/plugins/rtmp-services/CMakeLists.txt b/plugins/rtmp-services/CMakeLists.txt
 index be0364c..474ffa7 100644
 --- a/plugins/rtmp-services/CMakeLists.txt

@@ -29,9 +29,12 @@ class PanggungShizukuUserService : IPanggungShizukuService.Stub() {
         }
     }
 
-    /** PRV-03: Launch any app on a dedicated virtual display for multi-app window capture. */
+    /** PRV-03: Launch an allowlisted Android component on a virtual display (strictly validated). */
     override fun launchAppOnDisplay(componentName: String?, displayId: Int): Boolean {
         if (componentName.isNullOrBlank()) return false
+        if (displayId !in 0..999) return false
+        // Strict ComponentName validation prevents argument/flag injection
+        if (!Regex("^[a-zA-Z0-9_.]+/[a-zA-Z0-9_.$]+$").matches(componentName)) return false
         return try {
             val p = Runtime.getRuntime().exec(arrayOf("am", "start", "--display", displayId.toString(), "-n", componentName))
             p.waitFor() == 0
@@ -42,8 +45,11 @@ class PanggungShizukuUserService : IPanggungShizukuService.Stub() {
 
     /** PRV-05: Inject touch tap into captured app directly from OBS preview/Interact. */
     override fun injectTap(x: Float, y: Float): Boolean {
+        if (!x.isFinite() || !y.isFinite()) return false
+        val ix = x.toInt().coerceIn(0, 10000)
+        val iy = y.toInt().coerceIn(0, 10000)
         return try {
-            val p = Runtime.getRuntime().exec(arrayOf("input", "tap", x.toInt().toString(), y.toInt().toString()))
+            val p = Runtime.getRuntime().exec(arrayOf("input", "tap", ix.toString(), iy.toString()))
             p.waitFor() == 0
         } catch (_: Exception) {
             false
@@ -52,6 +58,7 @@ class PanggungShizukuUserService : IPanggungShizukuService.Stub() {
 
     /** PRV-05: Inject key event into captured app. */
     override fun injectKeyEvent(keyCode: Int): Boolean {
+        if (keyCode !in 0..320) return false
         return try {
             val p = Runtime.getRuntime().exec(arrayOf("input", "keyevent", keyCode.toString()))
             p.waitFor() == 0
@@ -63,15 +70,6 @@ class PanggungShizukuUserService : IPanggungShizukuService.Stub() {
     /** PRV-04: Verify UID 2000 shell access for REMOTE_SUBMIX audio capture. */
     override fun hasRemoteSubmixPermission(): Boolean = Process.myUid() == 2000 || Process.myUid() == 0
 
-    override fun execShell(cmd: String?): String {
-        if (cmd.isNullOrBlank()) return ""
-        return try {
-            val p = Runtime.getRuntime().exec(arrayOf("sh", "-c", cmd))
-            val txt = p.inputStream.bufferedReader().readText()
-            p.waitFor()
-            txt
-        } catch (e: Exception) {
-            "err: ${e.message}"
-        }
-    }
+    /** SECURITY: Arbitrary shell execution is permanently disabled to enforce least privilege. */
+    override fun execShell(cmd: String?): String = "Disabled for security"
 }

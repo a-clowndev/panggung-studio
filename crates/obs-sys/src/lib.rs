@@ -282,6 +282,7 @@ unsafe extern "C" {
     pub fn obs_output_get_total_bytes(output: *const obs_output_t) -> u64;
     pub fn obs_output_get_frames_dropped(output: *const obs_output_t) -> c_int;
     pub fn obs_output_get_total_frames(output: *const obs_output_t) -> c_int;
+    pub fn obs_output_get_congestion(output: *const obs_output_t) -> c_float;
     pub fn obs_sceneitem_set_visible(item: *mut obs_sceneitem_t, visible: bool) -> bool;
     pub fn obs_sceneitem_visible(item: *const obs_sceneitem_t) -> bool;
     pub fn obs_sceneitem_get_source(item: *const obs_sceneitem_t) -> *mut obs_source_t;
@@ -323,6 +324,7 @@ unsafe extern "C" {
 
     // Transitions
     pub fn obs_transition_set(transition: *mut obs_source_t, source: *mut obs_source_t);
+    pub fn obs_transition_clear(transition: *mut obs_source_t);
     pub fn obs_transition_start(
         transition: *mut obs_source_t,
         mode: c_int,

@@ -10,8 +10,13 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.media.projection.MediaProjectionManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.content.ContextCompat
 import io.panggung.obs.NativeBridge
@@ -22,13 +27,55 @@ class PanggungService : Service() {
         const val ACTION_START_FGS = "io.panggung.obs.START_FGS"
         const val ACTION_START_SCREEN = "io.panggung.obs.START_SCREEN"
         const val ACTION_STOP_SCREEN = "io.panggung.obs.STOP_SCREEN"
+        const val ACTION_NETWORK_CHANGED = "io.panggung.obs.NETWORK_CHANGED"
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
         const val EXTRA_FGS_TYPE = "fgs_type"
+        val networkGeneration = java.util.concurrent.atomic.AtomicLong(0L)
     }
 
     private val screenCapture = ScreenCapture()
     private var activeFgsTypes: Int = 0
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var netCallback: ConnectivityManager.NetworkCallback? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        try {
+            val pm = getSystemService(PowerManager::class.java)
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PanggungStudio::BroadcastWakeLock").apply {
+                setReferenceCounted(false)
+                acquire(6 * 60 * 60 * 1000L) // up to 6h IRL broadcast safety cap
+            }
+        } catch (e: Exception) {
+            Log.w("PanggungService", "WakeLock unavailable: ${e.message}")
+        }
+        try {
+            val cm = getSystemService(ConnectivityManager::class.java)
+            val req = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                @Volatile private var sawInitialNetwork = false
+                override fun onAvailable(network: Network) {
+                    if (!sawInitialNetwork) {
+                        sawInitialNetwork = true
+                        return
+                    }
+                    val gen = networkGeneration.incrementAndGet()
+                    Log.i("PanggungService", "Network switched/recovered (gen=$gen)")
+                }
+                override fun onLost(network: Network) {
+                    val gen = networkGeneration.incrementAndGet()
+                    Log.w("PanggungService", "Active network lost (gen=$gen)")
+                }
+            }
+            cm.registerNetworkCallback(req, cb)
+            netCallback = cb
+        } catch (e: Exception) {
+            Log.w("PanggungService", "NetworkCallback unavailable: ${e.message}")
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -111,6 +158,14 @@ class PanggungService : Service() {
 
     override fun onDestroy() {
         screenCapture.stop()
+        netCallback?.let {
+            try { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) } catch (_: Exception) {}
+        }
+        netCallback = null
+        wakeLock?.let {
+            try { if (it.isHeld) it.release() } catch (_: Exception) {}
+        }
+        wakeLock = null
         super.onDestroy()
     }
 }

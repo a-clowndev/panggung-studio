@@ -312,11 +312,18 @@ static void freeze_destroy(void *d) {
 static void freeze_render(void *d, gs_effect_t *efx) {
     UNUSED_PARAMETER(efx);
     struct freeze_ctx *f = d;
-    obs_source_t *target = obs_filter_get_target(f->context);
-    if (!target || !f->texrender) { obs_source_skip_video_filter(f->context); return; }
+    obs_source_t *raw_target = obs_filter_get_target(f->context);
+    obs_source_t *parent = obs_filter_get_parent(f->context);
+    if (!raw_target || !parent || !f->texrender) { obs_source_skip_video_filter(f->context); return; }
+    obs_source_t *target = obs_source_get_ref(raw_target);
+    if (!target) { obs_source_skip_video_filter(f->context); return; }
     uint32_t cx = obs_source_get_base_width(target);
     uint32_t cy = obs_source_get_base_height(target);
-    if (cx == 0 || cy == 0) { obs_source_skip_video_filter(f->context); return; }
+    if (cx == 0 || cy == 0) {
+        obs_source_release(target);
+        obs_source_skip_video_filter(f->context);
+        return;
+    }
 
     if (!f->frozen || !f->captured) {
         gs_texrender_reset(f->texrender);
@@ -324,11 +331,16 @@ static void freeze_render(void *d, gs_effect_t *efx) {
             struct vec4 clear = { 0.0f, 0.0f, 0.0f, 0.0f };
             gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
             gs_ortho(0.0f, (float)cx, 0.0f, (float)cy, -100.0f, 100.0f);
-            obs_source_video_render(target);
+            uint32_t flags = obs_source_get_output_flags(target);
+            if (target == parent && !(flags & OBS_SOURCE_CUSTOM_DRAW) && !(flags & OBS_SOURCE_ASYNC))
+                obs_source_default_render(target);
+            else
+                obs_source_video_render(target);
             gs_texrender_end(f->texrender);
             f->captured = true;
         }
     }
+    obs_source_release(target);
     gs_texture_t *tex = gs_texrender_get_texture(f->texrender);
     if (!tex) { obs_source_skip_video_filter(f->context); return; }
     gs_effect_t *def = obs_get_base_effect(OBS_EFFECT_DEFAULT);
@@ -392,11 +404,18 @@ static void dyndel_render(void *d, gs_effect_t *efx) {
     UNUSED_PARAMETER(efx);
     struct delay_ctx *c = d;
     if (c->delay_frames <= 0) { obs_source_skip_video_filter(c->context); return; }
-    obs_source_t *target = obs_filter_get_target(c->context);
+    obs_source_t *raw_target = obs_filter_get_target(c->context);
+    obs_source_t *parent = obs_filter_get_parent(c->context);
+    if (!raw_target || !parent) { obs_source_skip_video_filter(c->context); return; }
+    obs_source_t *target = obs_source_get_ref(raw_target);
     if (!target) { obs_source_skip_video_filter(c->context); return; }
     uint32_t cx = obs_source_get_base_width(target);
     uint32_t cy = obs_source_get_base_height(target);
-    if (cx == 0 || cy == 0) { obs_source_skip_video_filter(c->context); return; }
+    if (cx == 0 || cy == 0) {
+        obs_source_release(target);
+        obs_source_skip_video_filter(c->context);
+        return;
+    }
 
     gs_texrender_t *wr = c->ring[c->write_idx];
     if (wr) {
@@ -405,10 +424,15 @@ static void dyndel_render(void *d, gs_effect_t *efx) {
             struct vec4 clear = { 0.0f, 0.0f, 0.0f, 0.0f };
             gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
             gs_ortho(0.0f, (float)cx, 0.0f, (float)cy, -100.0f, 100.0f);
-            obs_source_video_render(target);
+            uint32_t flags = obs_source_get_output_flags(target);
+            if (target == parent && !(flags & OBS_SOURCE_CUSTOM_DRAW) && !(flags & OBS_SOURCE_ASYNC))
+                obs_source_default_render(target);
+            else
+                obs_source_video_render(target);
             gs_texrender_end(wr);
         }
     }
+    obs_source_release(target);
     if (c->filled < DELAY_RING_MAX) c->filled++;
     int offset = c->delay_frames < c->filled ? c->delay_frames : (c->filled - 1);
     int read_idx = (c->write_idx - offset + DELAY_RING_MAX) % DELAY_RING_MAX;

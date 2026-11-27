@@ -292,19 +292,19 @@ pub fn start_web_remote_server(port: u16, lan_access: bool, auth_token: &str) ->
                         let ok = constant_time_eq(provided.as_bytes(), expected.as_bytes());
                         let resp = if is_post_auth && ok {
                             format!(
-                                "HTTP/1.1 303 See Other\r\nLocation: /\r\nSet-Cookie: panggung_token={}; HttpOnly; SameSite=Strict; Path=/\r\nCache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                "HTTP/1.1 303 See Other\r\nLocation: /\r\nSet-Cookie: panggung_token={}; HttpOnly; SameSite=Strict; Path=/\r\nX-Frame-Options: DENY\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                                 expected
                             )
                         } else if ok {
                             let body = REMOTE_HTML.replace("__PANGGUNG_SESSION_TOKEN__", &expected);
                             format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Frame-Options: DENY\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'self' 'unsafe-inline'; connect-src ws: wss:\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                                 body.len(),
                                 body
                             )
                         } else {
                             format!(
-                                "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/html; charset=utf-8\r\nX-Frame-Options: DENY\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                                 UNAUTHORIZED_HTML.len(),
                                 UNAUTHORIZED_HTML
                             )
